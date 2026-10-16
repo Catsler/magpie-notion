@@ -1,0 +1,51 @@
+{
+  "allowances": [
+    {
+      "bucketId": "standard",
+      "cadence": "billing_period",
+      "enforcement": "enforced",
+      "limit": 100,
+      "periodEndMs": 1794841200000,
+      "periodStartMs": 1792162800000,
+      "state": "resolved",
+      "used": 0.01
+    },
+    {
+      "bucketId": "auto",
+      "cadence": "billing_period",
+      "state": "not_exposed"
+    },
+    {
+      "bucketId": "flex",
+      "cadence": "billing_period",
+      "state": "not_exposed"
+    },
+    {
+      "bucketId": "standard",
+      "cadence": "rolling",
+      "enforcement": "enforced",
+      "limit": 100,
+      "resetsInSeconds": 20101,
+      "state": "resolved",
+      "used": 0.03,
+      "window": "6h"
+    }
+  ],
+  "billingPeriodWindow": {
+    "cadence": "billing_period",
+    "creditType": "basic_ai_credits",
+    "limit": 100,
+    "periodEndMs": 1794841200000,
+    "scope": "per_user",
+    "used": 0.01
+  },
+  "resetsInSeconds": 20101,
+  "status": "within_limit",
+  "window": {
+    "creditType": "basic_ai_credits",
+    "limit": 100,
+    "scope": "per_user",
+    "used": 0.03,
+    "window": "6h"
+  }
+}
