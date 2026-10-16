@@ -7,6 +7,9 @@
 Notion 改版后可能失效；开发跟踪
 [magpie-community/plugins#118](https://github.com/magpie-community/plugins/issues/118)。
 
+插件图标使用 Notion 官方黑白 N 方块标志，源文件保存在 `notion.svg`，
+并内嵌到包元数据里。名称与标志属于 Notion；本项目是非官方插件。
+
 ## 安装
 
 ```sh

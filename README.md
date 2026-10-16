@@ -224,6 +224,10 @@ identifiers before adding fixtures; never commit a raw HAR.
 
 ## Applicable terms
 
+The plugin icon is Notion's [official block logo](https://app.notion.com/images/notion-logo-block-main.svg),
+stored in `notion.svg` and embedded in the package metadata. Notion's name and
+logo belong to Notion; this is an unofficial plugin.
+
 Review the account's agreement and
 [Notion AI and Notion Credit Supplementary Terms](https://notion.notion.site/Notion-AI-and-Notion-Credit-Supplementary-Terms-fa9034c8b5a04818a6baf3eac2adddbb),
 [Content and Use Policy](https://www.notion.so/Content-Use-Policy-1b9a773d5583486cb5c1d39a8d777a55),
