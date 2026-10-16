@@ -312,3 +312,15 @@ test("quota: a response that reads no window at all is an error, not an empty ac
     expect(result.signIn).not.toBe("expired")
   }
 })
+
+test.each([
+  { allowances: [{}] },
+  { allowances: [null] },
+  { allowances: [{ state: "unknown" }] },
+  { allowances: [{ state: "not_exposed" }, {}] },
+])("quota: malformed allowances are not explicit vendor withholding (%j)", async ({ allowances }) => {
+  const { result } = await usage({ status: "within_limit", allowances })
+  expect(result.error).toBe("Notion AI returned an unsupported quota response.")
+  expect(result.windows).toEqual([])
+  expect(result.signIn).not.toBe("expired")
+})

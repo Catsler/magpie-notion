@@ -31,6 +31,12 @@ function tooLarge() {
   return new ProviderError(502, "transcript_frame_too_large", "Notion AI returned an oversized transcript frame.")
 }
 
+function frameLine(raw) {
+  const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw
+  if (line.length > MAX_FRAME) throw tooLarge()
+  return line.trim()
+}
+
 export function sessionError(session) {
   const allowance = session?.last_turn_allowance
   if (allowance?.notion_exhausted === true) throw new ProviderError(402, "credits_exhausted", "The Notion workspace has exhausted its Notion AI credits.")
@@ -56,10 +62,9 @@ export async function* readNDJSON(body, signal) {
       let newline
       let start = 0
       while ((newline = pending.indexOf("\n", start)) >= 0) {
-        const line = pending.slice(start, newline).trim()
+        const line = frameLine(pending.slice(start, newline))
         start = newline + 1
         if (!line) continue
-        if (line.length > MAX_FRAME) throw tooLarge()
         try { yield JSON.parse(line) } catch (error) {
           if (error instanceof SyntaxError) throw invalid()
           throw error
@@ -67,12 +72,14 @@ export async function* readNDJSON(body, signal) {
       }
       pending = start ? pending.slice(start) : pending
       // A frame that never ends must not grow without bound either.
-      if (pending.length > MAX_FRAME) throw tooLarge()
+      // A trailing CR may be the first half of a CRLF delimiter.
+      if (pending.length > MAX_FRAME + (pending.endsWith("\r") ? 1 : 0)) throw tooLarge()
     }
     pending += decoder.decode()
-    if (pending.trim()) {
+    const line = frameLine(pending)
+    if (line) {
       let value
-      try { value = JSON.parse(pending) } catch { throw invalid() }
+      try { value = JSON.parse(line) } catch { throw invalid() }
       yield value
     }
   } finally {
@@ -133,7 +140,8 @@ export async function* transcriptEvents(frames, signal, { afterSequence = 0 } = 
         if (!Array.isArray(patch.ops)) throw invalid()
         let added = ""
         for (const operation of patch.ops) added += append(entity, operation)
-        if (entity === tail) appended = (appended ?? "") + added
+        // Multipart edits can insert before text already sent to the client.
+        if (entity === tail && entity.content.length === 1) appended = (appended ?? "") + added
         else rebuild = true
       } else if (["session_status", "session"].includes(patch.op)) checkSession(patch.session)
       else if (patch.op !== "committed") throw invalid()

@@ -451,3 +451,50 @@ test("a model without an id is never published", async () => {
   const models = await protocol.models({ auth })
   expect(Object.keys(models)).toEqual([model.model])
 })
+
+test("the frame limit treats a CRLF boundary identically across network reads", async () => {
+  const limit = 4 * 1024 * 1024
+  const base = JSON.stringify({ type: "keepalive", pad: "" })
+  const line = JSON.stringify({ type: "keepalive", pad: "x".repeat(limit - base.length) })
+  const bytes = new TextEncoder().encode(line + "\r\n")
+  for (const parts of [[bytes], [bytes.subarray(0, bytes.length - 1), bytes.subarray(bytes.length - 1)]]) {
+    const body = new ReadableStream({ start(c) { for (const part of parts) c.enqueue(part); c.close() } })
+    const frames = await collect(readNDJSON(body))
+    expect(frames).toHaveLength(1)
+    expect(frames[0].pad.length).toBe(limit - base.length)
+  }
+})
+
+test("oversized outer JSON whitespace cannot bypass the frame limit", async () => {
+  const bytes = new TextEncoder().encode(" ".repeat(4 * 1024 * 1024) + "{}\n")
+  for (const parts of [[bytes], [bytes.subarray(0, bytes.length - 2), bytes.subarray(bytes.length - 2)]]) {
+    const body = new ReadableStream({ start(c) { for (const part of parts) c.enqueue(part); c.close() } })
+    await expect(collect(readNDJSON(body))).rejects.toMatchObject({ code: "transcript_frame_too_large" })
+  }
+})
+
+test("an append inside multipart text fails before sending a misplaced delta", async () => {
+  for (const index of [0, 1]) {
+    const initial = message("A")
+    initial.entity.content.push({ type: "text", text: "B" })
+    const events = []
+    let failure
+    try {
+      for await (const event of transcriptEvents(iterable([
+        frame(initial),
+        frame({ op: "patch", id: "assistant", ops: [{ op: "append", path: `/content/${index}/text`, value: "X" }] }),
+        frame(done()),
+      ]))) events.push(event)
+    } catch (error) {
+      failure = error
+    }
+    if (index === 0) {
+      expect(failure?.code).toBe("transcript_rewritten")
+      expect(events).toEqual([{ type: "text", text: "AB" }])
+    } else {
+      expect(failure).toBeUndefined()
+      expect(events.filter((event) => event.type === "text").map((event) => event.text).join("")).toBe("ABX")
+      expect(events.at(-1)).toMatchObject({ type: "done", text: "ABX" })
+    }
+  }
+})

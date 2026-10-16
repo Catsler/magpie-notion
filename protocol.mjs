@@ -224,7 +224,7 @@ function quotaWindows(data) {
   // Buckets the vendor itself marked unexposed are an understood answer - it
   // names what it will not show. Anything else that reads no window is an
   // unreadable response, which is an error to show, never an empty account.
-  const withheld = Array.isArray(data.allowances) && data.allowances.length > 0 && resolved.length === 0
+  const withheld = Array.isArray(data.allowances) && data.allowances.length > 0 && data.allowances.every((entry) => entry?.state === "not_exposed")
   return withheld ? [] : undefined
 }
 
