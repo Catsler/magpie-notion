@@ -3,7 +3,7 @@ import { execFile } from "node:child_process"
 import { createCipheriv, pbkdf2Sync, randomBytes } from "node:crypto"
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { delimiter, join } from "node:path"
 import { browserReader, createPlugin } from "../core.mjs"
 import protocol from "../protocol.mjs"
 import { SessionError, bestCookies, browserStores, cookieHeader, copyToTemporary, decryptValue, findDevtoolsSession, findSession, _internal } from "../session.mjs"
@@ -596,4 +596,97 @@ test("a runtime without WebSocket says so instead of blaming the encryption", as
   } finally {
     globalThis.WebSocket = real
   }
+})
+
+test("the profile directories the environment names are taken first, and taken once", () => {
+  const one = join("profiles", "one")
+  const two = join("profiles", "two")
+  const three = join("profiles", "three")
+  // Both names take a list, separated the way the platform separates paths;
+  // `two` is named twice and the blank parts are not directories at all.
+  const roots = _internal.configuredRoots({
+    NOTION_BROWSER_PROFILE: [one, two].join(delimiter),
+    MAGPIE_NOTION_BROWSER_PROFILE: [two, three, "   ", ""].join(delimiter),
+  })
+  expect(roots).toEqual([
+    { browser: "Chromium", root: one },
+    { browser: "Chromium", root: two },
+    { browser: "Chromium", root: three },
+  ])
+  expect(_internal.configuredRoots({})).toEqual([])
+  expect(_internal.configuredRoots(undefined)).toEqual([])
+})
+
+test("a profile named in the environment is the first root on every platform", () => {
+  const named = join("named", "profile")
+  const platforms = [
+    ["win32", { LOCALAPPDATA: "L" }, "H", join("L", "Google", "Chrome", "User Data"), ["Chrome", "Edge", "Brave", "Chromium"]],
+    ["darwin", {}, "/Users/x", join("/Users/x", "Library", "Application Support", "Google", "Chrome"), ["Chrome", "Edge", "Brave", "Chromium"]],
+    ["linux", { XDG_CONFIG_HOME: "/c" }, "/home/x", join("/c", "google-chrome"), ["Chrome", "Chromium", "Edge", "Brave"]],
+  ]
+  for (const [platform, env, home, first, following] of platforms) {
+    const roots = _internal.chromiumRoots(platform, { ...env, NOTION_BROWSER_PROFILE: named }, home)
+    expect(roots[0]).toEqual({ browser: "Chromium", root: named })
+    // The browser the build would have read on its own still comes next.
+    expect(roots[1]).toEqual({ browser: "Chrome", root: first })
+    expect(roots.slice(1, 5).map((store) => store.browser)).toEqual(following)
+  }
+})
+
+test("a profile that has only written its debugging port still counts as a store", () => {
+  const home = mkdtempSync(join(tmpdir(), "magpie-port-"))
+  try {
+    const local = join(home, "AppData", "Local")
+    const root = join(local, "Google", "Chrome", "User Data")
+    mkdirSync(root, { recursive: true })
+    // A headless Chromium writes its port before it writes a cookie store.
+    writeFileSync(join(root, "DevToolsActivePort"), `${9222}\n/devtools/browser/devtools-path\n`)
+    const stores = browserStores({ platform: "win32", home, env: { LOCALAPPDATA: local } })
+    const chrome = stores.filter((store) => store.browser === "Chrome")
+    expect(chrome.length).toBe(1)
+    expect(chrome[0].db).toBeUndefined()
+    expect(chrome[0]).toMatchObject({ kind: "chromium", browser: "Chrome", profile: "Default", root })
+  } finally {
+    remove(home)
+  }
+})
+
+test("findSession steps over a store that has no database and reads the next one", async () => {
+  const portOnly = { kind: "chromium", browser: "Chrome", root: "unused", profile: "Default", db: undefined, localState: "unused" }
+  const rows = [
+    { name: "token_v2", value: "session-secret", host: ".notion.so" },
+    { name: "notion_user_id", value: USER, host: ".notion.so" },
+  ]
+  const asked = []
+  const found = await findSession({
+    stores: [portOnly, firefox("one.default", "db")],
+    copyStore: (store) => { asked.push(store.db); return { path: store.db, remove: () => {} } },
+    openDatabase: () => database(rows),
+  })
+  // The store with no database is never handed to a copy or a connection.
+  expect(asked).toEqual(["db"])
+  expect(found).toEqual({ cookie: `token_v2=session-secret; notion_user_id=${USER}`, browser: "Firefox", profile: "one.default", activeUserId: USER })
+})
+
+test("readStore refuses a store that has no database, and names the reason", async () => {
+  const error = await captureAsync(() => _internal.readStore({ kind: "chromium", browser: "Chrome", profile: "Default", db: undefined, root: "unused", localState: "unused" }))
+  expect(error).toBeInstanceOf(SessionError)
+  expect(error.reason).toBe("no-store")
+})
+
+test("a Bun store is read through query(), the way Bun's sqlite answers", () => {
+  const rows = [{ name: "token_v2", host: ".notion.so" }]
+  const asked = []
+  const bun = { query: (sql) => { asked.push(sql); return { all: () => rows } } }
+  expect(_internal.all(bun, "SELECT 1")).toBe(rows)
+  expect(asked).toEqual(["SELECT 1"])
+})
+
+test("a node:sqlite store is read through prepare(), the way DatabaseSync answers", () => {
+  const rows = [{ name: "token_v2", host: ".notion.so" }]
+  const asked = []
+  // node:sqlite's DatabaseSync has prepare() and no query() at all.
+  const node = { prepare: (sql) => { asked.push(sql); return { all: () => rows } } }
+  expect(_internal.all(node, "SELECT 2")).toBe(rows)
+  expect(asked).toEqual(["SELECT 2"])
 })

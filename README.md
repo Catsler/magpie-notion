@@ -63,6 +63,19 @@ Two methods are offered, and neither asks for a workspace UUID:
   session, an optional workspace UUID and an optional active-user UUID when the
   browser holds several Notion identities.
 
+A container or server with no desktop browser can point this build at a
+Chromium profile directory that was prepared ahead of time (or kept after one
+sign-in): set `NOTION_BROWSER_PROFILE` or `MAGPIE_NOTION_BROWSER_PROFILE` to
+one or more such directories, separated the way the platform separates paths
+(`;` on Windows, `:` on macOS and Linux). A named directory is the profile
+directory itself, the one holding `Cookies` (`Network/Cookies` or `Cookies`)
+and `Local State`, and those directories are read before the system's own
+Chrome, Edge, Brave and Chromium locations; a directory named in both
+variables is read once. A directory holding only a `DevToolsActivePort` is
+asked over that debugging port instead. Mount the profile directory alone
+rather than a whole user or home directory, and never expose a debugging port
+beyond the machine itself.
+
 The workspace (`spaceId`) does not have to be typed. The session is asked for
 its spaces and each candidate is probed with `getAvailableModels` until one
 answers; that answer is also the model catalog that is then used, and it is

@@ -15,7 +15,7 @@ import { spawn } from "node:child_process"
 import { createDecipheriv, pbkdf2Sync } from "node:crypto"
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs"
 import { homedir, tmpdir } from "node:os"
-import { join } from "node:path"
+import { delimiter, join } from "node:path"
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 // The cookies a Notion web session is made of, by the domains the web client
@@ -29,6 +29,26 @@ const NAMES = ["token_v2", "notion_user_id", "notion_browser_id", "notion_check_
 // been seen taking half a minute on the socket alone - so the read over a
 // debugging port is given longer than a file that is already there.
 const DEVTOOLS_TIMEOUT = 30_000
+// A profile directory named in the environment is read before the desktop's
+// own browsers: a container has no desktop profile, but an operator can put a
+// Chromium profile where this build can reach it, and then that one is meant.
+// Either name takes one directory or a list of them, separated the way the
+// platform separates paths.
+const PROFILE_ENV = ["NOTION_BROWSER_PROFILE", "MAGPIE_NOTION_BROWSER_PROFILE"]
+
+// configuredRoots turns that environment into the stores' roots, most
+// explicit first: each named directory is one profile directory, and a name
+// repeated in both variables is used once.
+export function configuredRoots(env) {
+  const roots = []
+  for (const name of PROFILE_ENV) {
+    for (const part of String(env?.[name] ?? "").split(delimiter)) {
+      const root = part.trim()
+      if (root && !roots.some((entry) => entry.root === root)) roots.push({ browser: "Chromium", root })
+    }
+  }
+  return roots
+}
 
 export class SessionError extends Error {
   constructor(message, reason) {
@@ -79,6 +99,14 @@ export function browserStores(options = {}) {
         }
       }
     }
+    // A browser this build drives itself - a headless Chromium started with a
+    // debugging port beside the container it serves - may have run long enough
+    // to write its port before its store: the store is then read over that
+    // port, so the profile still counts. This only adds a profile whose store
+    // is not there at all.
+    if (!stores.some((store) => store.root === root) && existsSync(join(root, "DevToolsActivePort"))) {
+      stores.push({ kind: "chromium", browser, root, profile: "Default", db: undefined, localState })
+    }
   }
   for (const { browser, root } of firefoxRoots(platform, env, home)) {
     if (!existsSync(root)) continue
@@ -94,6 +122,7 @@ function chromiumRoots(platform, env, home) {
   if (platform === "win32") {
     const local = env.LOCALAPPDATA ?? join(home, "AppData", "Local")
     return [
+      ...configuredRoots(env),
       { browser: "Chrome", root: join(local, "Google", "Chrome", "User Data") },
       { browser: "Edge", root: join(local, "Microsoft", "Edge", "User Data") },
       { browser: "Brave", root: join(local, "BraveSoftware", "Brave-Browser", "User Data") },
@@ -103,6 +132,7 @@ function chromiumRoots(platform, env, home) {
   if (platform === "darwin") {
     const support = join(home, "Library", "Application Support")
     return [
+      ...configuredRoots(env),
       { browser: "Chrome", root: join(support, "Google", "Chrome") },
       { browser: "Edge", root: join(support, "Microsoft Edge") },
       { browser: "Brave", root: join(support, "BraveSoftware", "Brave-Browser") },
@@ -111,6 +141,7 @@ function chromiumRoots(platform, env, home) {
   }
   const config = env.XDG_CONFIG_HOME ?? join(home, ".config")
   return [
+    ...configuredRoots(env),
     { browser: "Chrome", root: join(config, "google-chrome") },
     { browser: "Chromium", root: join(config, "chromium") },
     { browser: "Edge", root: join(config, "microsoft-edge") },
@@ -140,9 +171,12 @@ function firefoxRoots(platform, env, home) {
 // its values are bound to the browser.
 export async function findSession(options = {}) {
   const stores = options.stores ?? browserStores(options)
-  if (!stores.length) throw new SessionError("No Chrome, Edge, Brave, Chromium or Firefox profile was found on this machine.", "no-browser")
+  if (!stores.length) throw new SessionError("No Chrome, Edge, Brave, Chromium or Firefox profile was found on this machine. In a container, set NOTION_BROWSER_PROFILE to a Chromium profile directory, or sign in with the Notion web session (paste the Cookie header).", "no-browser")
   const problems = []
   for (const store of stores) {
+    // A profile listed for its debugging port alone has no store to open; the
+    // port is asked instead, below, and asking it is not this loop's job.
+    if (!store.db) continue
     const where = `${store.browser} (${store.profile})`
     try {
       const cookies = await readStore(store, options)
@@ -308,12 +342,13 @@ export function cookieHeader(cookies) {
 }
 
 async function readStore(store, options) {
+  if (!store.db) throw new SessionError("this profile has no cookie store to read", "no-store")
   const copy = options.copyStore ?? copyToTemporary
   const temporary = copy(store)
   try {
     const database = await openDatabase(temporary.path, options)
     try {
-      const rows = store.kind === "firefox" ? database.query("SELECT name, value, host FROM moz_cookies WHERE host LIKE '%notion%' AND name IN ('token_v2','notion_user_id','notion_browser_id','notion_device_id','notion_os','notion_check_cookie_consent')").all() : database.query("SELECT name, encrypted_value, host_key AS host FROM cookies WHERE host_key LIKE '%notion%' AND name IN ('token_v2','notion_user_id','notion_browser_id','notion_device_id','notion_os','notion_check_cookie_consent')").all()
+      const rows = store.kind === "firefox" ? all(database, "SELECT name, value, host FROM moz_cookies WHERE host LIKE '%notion%' AND name IN ('token_v2','notion_user_id','notion_browser_id','notion_device_id','notion_os','notion_check_cookie_consent')") : all(database, "SELECT name, encrypted_value, host_key AS host FROM cookies WHERE host_key LIKE '%notion%' AND name IN ('token_v2','notion_user_id','notion_browser_id','notion_device_id','notion_os','notion_check_cookie_consent')")
       const key = store.kind === "firefox" || rows.every((row) => !row.encrypted_value) ? undefined : await valueKey(store, options)
       const cookies = []
       for (const row of rows) {
@@ -389,6 +424,13 @@ export function copyToTemporary(store, options = {}) {
     throw new SessionError(error?.message ?? "the cookie store could not be copied", "unreadable")
   }
   return { path, remove: () => discard(directory) }
+}
+
+// A store is read with whichever SQLite the runtime has: Bun's Database
+// answers query(), node:sqlite's DatabaseSync answers prepare(). Reading a
+// store must not depend on being hosted by one of them.
+function all(database, sql) {
+  return typeof database.query === "function" ? database.query(sql).all() : database.prepare(sql).all()
 }
 
 export async function openDatabase(path, options = {}) {
@@ -540,4 +582,4 @@ function runFile(file, args, options = {}) {
   })
 }
 
-export const _internal = { UUID, HOSTS, NAMES, notionHost, chromiumRoots, firefoxRoots, readStore, valueKey, devtoolsEndpoint, connectDevtools, gcm, cbc, runFile, toBuffer }
+export const _internal = { UUID, HOSTS, NAMES, notionHost, configuredRoots, chromiumRoots, firefoxRoots, readStore, valueKey, devtoolsEndpoint, connectDevtools, gcm, cbc, runFile, toBuffer, all }

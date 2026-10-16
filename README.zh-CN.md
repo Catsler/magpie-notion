@@ -32,6 +32,16 @@ magpie plugin login notion
 - **手动粘贴 Cookie 请求头**：给本插件读不了的浏览器用。填你本人 Notion
   网页会话的完整 Cookie 请求头，`spaceId`、activeUserId 都可留空。
 
+没有桌面浏览器的容器或服务器，可以把事先准备好（或登录一次后保留下来）的
+Chromium profile 目录指给插件：设 `NOTION_BROWSER_PROFILE` 或
+`MAGPIE_NOTION_BROWSER_PROFILE`，各接受一个或多个这样的目录，多个用当前平台的
+路径分隔符分隔（Windows 分号，macOS 与 Linux 冒号）。这里指的是 profile 目录
+本身，也就是存放 `Cookies`（`Network/Cookies` 或 `Cookies`）和 `Local State`
+的那个目录；这些目录会排在系统默认的 Chrome、Edge、Brave、Chromium 位置之前
+优先读取，两个变量里重复出现的同一目录只读一次。目录里只有 `DevToolsActivePort`
+时，则改走该调试端口读取。注意：只挂载 profile 目录本身，不要挂载整个用户目录；
+调试端口不要暴露到公网。
+
 工作区（`spaceId`）是自动发现的：先问会话有哪些 space，再逐个用
 `getAvailableModels` 探测，第一个能答的就是当前工作区，那份模型表也就直接
 用上了，并按会话缓存 30 分钟。你也可以显式填一个 UUID，插件会在发请求前
