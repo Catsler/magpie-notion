@@ -4,9 +4,9 @@ import { createCipheriv, pbkdf2Sync, randomBytes } from "node:crypto"
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { createPlugin } from "../core.mjs"
+import { browserReader, createPlugin } from "../core.mjs"
 import protocol from "../protocol.mjs"
-import { SessionError, browserStores, cookieHeader, copyToTemporary, decryptValue, findDevtoolsSession, findSession, _internal } from "../session.mjs"
+import { SessionError, bestCookies, browserStores, cookieHeader, copyToTemporary, decryptValue, findDevtoolsSession, findSession, _internal } from "../session.mjs"
 
 const UUID = "11111111-1111-4111-8111-111111111111"
 const USER = "22222222-2222-4222-8222-222222222222"
@@ -74,7 +74,11 @@ test("the roots name the browsers of each platform, most likely first", () => {
   expect(windows.map((store) => store.browser)).toEqual(["Chrome", "Edge", "Brave", "Chromium"])
   expect(windows[0].root).toBe(join("L", "Google", "Chrome", "User Data"))
   expect(_internal.chromiumRoots("darwin", {}, "/Users/x")[0].root).toContain(join("Library", "Application Support"))
-  expect(_internal.chromiumRoots("linux", {}, "/home/x").map((store) => store.browser)).toContain("Chromium")
+  const linux = _internal.chromiumRoots("linux", {}, "/home/x").map((store) => store.root)
+  expect(linux).toContain(join("/home/x", ".config", "chromium"))
+  // Flatpak and Snap keep their profiles outside the configuration directory.
+  expect(linux).toContain(join("/home/x", ".var", "app", "com.google.Chrome", "config", "google-chrome"))
+  expect(linux).toContain(join("/home/x", "snap", "chromium", "current", ".config", "chromium"))
   expect(_internal.firefoxRoots("linux", { XDG_CONFIG_HOME: "/c" }, "/h").map((store) => store.root)).toEqual([join("/h", ".mozilla", "firefox"), join("/c", "mozilla", "firefox")])
   expect(_internal.firefoxRoots("win32", { APPDATA: "R" }, "H")[0].root).toBe(join("R", "Mozilla", "Firefox", "Profiles"))
 })
@@ -102,6 +106,97 @@ test("browserStores lists the profiles a browser names, in the layout each one u
 test("cookieHeader joins the session's cookies once, in the order they were found", () => {
   expect(cookieHeader([{ name: "token_v2", value: "a" }, { name: "notion_user_id", value: "u" }, { name: "token_v2", value: "a" }, { name: "", value: "x" }, { name: "empty", value: "" }])).toBe("token_v2=a; notion_user_id=u")
   expect(cookieHeader([])).toBe("")
+})
+
+test("cookieHeader keeps one value per name, from the domain the web client serves", () => {
+  const cookies = [
+    { name: "token_v2", value: "personal-site", host: "www.notion.so" },
+    { name: "notion_user_id", value: "u1", host: "www.notion.so" },
+    { name: "token_v2", value: "workspace-site", host: ".app.notion.com" },
+    { name: "notion_user_id", value: "u2", host: "app.notion.com" },
+  ]
+  expect(cookieHeader(cookies)).toBe("token_v2=workspace-site; notion_user_id=u2")
+  // A devtools answer names the same field "domain", not "host".
+  expect(bestCookies([{ name: "token_v2", value: "old", domain: "notion.so" }, { name: "token_v2", value: "new", domain: ".app.notion.com" }])).toEqual([{ name: "token_v2", value: "new", domain: ".app.notion.com" }])
+})
+
+test("findSession prefers the workspace session over an older personal one", async () => {
+  const rows = [
+    { name: "token_v2", value: "personal-site", host: "www.notion.so" },
+    { name: "token_v2", value: "workspace-site", host: ".app.notion.com" },
+    { name: "notion_user_id", value: USER, host: ".app.notion.com" },
+  ]
+  const found = await findSession({ ...temporary, stores: [firefox("one.default", "db")], openDatabase: () => database(rows) })
+  expect(found.cookie).toBe(`token_v2=workspace-site; notion_user_id=${USER}`)
+  expect(found.activeUserId).toBe(USER)
+})
+
+test("browserStores puts the profile the browser last used first", () => {
+  const home = mkdtempSync(join(tmpdir(), "magpie-lastused-"))
+  try {
+    const local = join(home, "AppData", "Local")
+    const root = join(local, "Google", "Chrome", "User Data")
+    for (const profile of ["Default", "Profile 2"]) {
+      mkdirSync(join(root, profile, "Network"), { recursive: true })
+      writeFileSync(join(root, profile, "Network", "Cookies"), "not a database")
+    }
+    writeFileSync(join(root, "Local State"), JSON.stringify({ profile: { info_cache: { Default: {}, "Profile 2": {} }, last_used: "Profile 2" } }))
+    const stores = browserStores({ platform: "win32", home, env: { LOCALAPPDATA: local } })
+    expect(stores.map((store) => store.profile)).toEqual(["Profile 2", "Default"])
+  } finally {
+    remove(home)
+  }
+})
+
+test("one row this build cannot open does not sink the session beside it", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "magpie-rows-"))
+  try {
+    const key = randomBytes(32)
+    const localState = join(directory, "Local State")
+    writeFileSync(localState, JSON.stringify({ os_crypt: { encrypted_key: Buffer.concat([Buffer.from("DPAPI"), randomBytes(32)]).toString("base64") } }))
+    const rows = [
+      { name: "token_v2", encrypted_value: gcmSeal("session-secret", key), host: ".notion.so" },
+      { name: "notion_os", encrypted_value: Buffer.concat([Buffer.from("v20"), randomBytes(48)]), host: ".notion.so" },
+    ]
+    const store = { kind: "chromium", browser: "Chrome", profile: "Default", db: "unused", localState }
+    // The DPAPI unwrap is answered offline; the v20 row is what this build
+    // cannot open, and only the session itself is allowed to fail the store.
+    const found = await findSession({ ...temporary, stores: [store], openDatabase: () => database(rows), platform: "win32", run: async () => key.toString("base64") })
+    expect(found.cookie).toBe("token_v2=session-secret")
+    const denied = await captureAsync(() => findSession({ ...temporary, stores: [{ ...store, profile: "Other" }, store], openDatabase: () => database([{ name: "token_v2", encrypted_value: Buffer.concat([Buffer.from("v20"), randomBytes(48)]), host: ".notion.so" }]), platform: "win32", run: async () => key.toString("base64") }))
+    expect(denied).toBeInstanceOf(SessionError)
+    expect(denied.message).toContain("v20")
+  } finally {
+    remove(directory)
+  }
+})
+
+test("the desktop keychain is asked under the name each browser files its key as", async () => {
+  const asked = []
+  const run = async (file, args) => { asked.push([file, ...args]); return "offline-key" }
+  const mac = await _internal.valueKey({ browser: "Edge", localState: "unused" }, { platform: "darwin", run })
+  expect(mac).toMatchObject({ cipher: "cbc" })
+  expect(asked[0]).toEqual(["/usr/bin/security", "find-generic-password", "-w", "Microsoft Edge Safe Storage"])
+  asked.length = 0
+  const linux = await _internal.valueKey({ browser: "Edge", localState: "unused" }, { platform: "linux", run })
+  expect(linux).toMatchObject({ cipher: "cbc" })
+  expect(asked[0]).toEqual(["secret-tool", "lookup", "application", "microsoft-edge"])
+})
+
+test("a readStore copy is taken back after it has been read", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "magpie-copy-"))
+  const before = leftovers().length
+  try {
+    const db = join(directory, "Cookies")
+    writeFileSync(db, "not a database")
+    const store = { kind: "chromium", browser: "Chrome", profile: "Default", db, localState: join(directory, "Local State") }
+    const error = await captureAsync(() => findSession({ stores: [store], openDatabase: () => database([]) }))
+    expect(error).toBeInstanceOf(SessionError)
+    expect(error.message).toContain("has no Notion session")
+  } finally {
+    remove(directory)
+  }
+  expect(leftovers().length).toBe(before)
 })
 
 test("a v10 value is opened the way Windows writes it, with AES-256-GCM", () => {
@@ -458,5 +553,47 @@ test.skipIf(!sqlite || process.platform !== "win32")("a v20 store is reported wi
     expect(error.message).toContain("paste the Cookie header")
   } finally {
     remove(directory)
+  }
+})
+
+test("reusing one browser read does not mix up the accounts that share it", async () => {
+  const mock = mockNotion()
+  const other = "33333333-3333-4333-8333-333333333333"
+  let reads = 0
+  const session = { findSession: async () => { reads++; return { cookie: "token_v2=live", browser: "Chrome", profile: "Default" } } }
+  const plugin = createPlugin(protocol, { session })
+  const first = { type: "api", key: "token_v2=kept", metadata: { browser: "Chrome", profile: "Default", spaceId: UUID } }
+  const second = { type: "api", key: "token_v2=kept", metadata: { browser: "Chrome", profile: "Default", spaceId: other } }
+  expect((await chat(plugin, first)).status).toBe(200)
+  expect((await chat(plugin, second)).status).toBe(200)
+  expect(reads).toBe(1)
+  // One read is shared, but each request still runs in the workspace its own
+  // sign-in names.
+  const created = mock.calls.filter((call) => call.name === "createAgentThread")
+  expect(created.map((call) => call.data.spaceId)).toEqual([UUID, other])
+  expect(created.every((call) => call.init.headers.Cookie === "token_v2=live")).toBe(true)
+  globalThis.fetch = realFetch
+})
+
+test("a browser read that fails keeps the saved session and the reason it failed", async () => {
+  const session = { findSession: async () => { throw new SessionError("Chrome is running and holds its cookie store open; close Chrome and sign in again", "locked") } }
+  const reader = browserReader(session, 60_000)
+  const kept = { type: "api", key: "token_v2=kept", metadata: { browser: "Chrome", profile: "Default", spaceId: UUID } }
+  const read = await reader.read(kept)
+  expect(read.key).toBe("token_v2=kept")
+  expect(read.metadata.spaceId).toBe(UUID)
+  expect(read.metadata.lastReadError).toContain("close Chrome")
+})
+
+test("a runtime without WebSocket says so instead of blaming the encryption", async () => {
+  const real = globalThis.WebSocket
+  globalThis.WebSocket = undefined
+  try {
+    const error = await captureAsync(() => _internal.connectDevtools("ws://127.0.0.1:9222/devtools/browser/token", 20))
+    expect(error).toBeInstanceOf(SessionError)
+    expect(error.reason).toBe("unsupported-runtime")
+    expect(error.message).toContain("debugging port")
+  } finally {
+    globalThis.WebSocket = real
   }
 })

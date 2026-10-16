@@ -109,16 +109,29 @@ function streamResponse(chunks, cancel) {
   }), { headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache" } })
 }
 
-async function bufferedResponse(chunks) {
-  let result
+// bufferedResponse answers a non-streaming request from the same event
+// contract the streaming path uses: text deltas, then one explicit done whose
+// text is the committed answer. The done text is authoritative, because a
+// provisional message that was streamed can be replaced by a shorter committed
+// one, and nothing must be invented when the stream ends without it.
+async function bufferedResponse(events, model, signal) {
+  const id = "chatcmpl-" + randomUUID()
+  const created = Math.floor(Date.now() / 1000)
   let content = ""
   let finishReason
-  for await (const chunk of chunks) {
-    result ??= chunk
-    content += chunk.choices[0].delta.content ?? ""
-    finishReason = chunk.choices[0].finish_reason ?? finishReason
+  for await (const event of events) {
+    signal.throwIfAborted()
+    if (event?.type === "text" && typeof event.text === "string") content += event.text
+    else if (event?.type === "done" && ["stop", "length", "content_filter"].includes(event.finishReason ?? "stop")) {
+      if (typeof event.text === "string") content = event.text
+      finishReason = event.finishReason ?? "stop"
+      break
+    } else {
+      throw new ProviderError(502, "invalid_upstream_event", "Notion AI returned an unsupported response event.")
+    }
   }
-  return Response.json({ id: result.id, object: "chat.completion", created: result.created, model: result.model, choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: finishReason }] })
+  if (finishReason === undefined) throw new ProviderError(502, "incomplete_upstream", "Notion AI ended the response without a verified completion event.")
+  return Response.json({ id, object: "chat.completion", created, model, choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: finishReason }] })
 }
 
 function scopedSignal(signal, timeoutMs) {
@@ -169,26 +182,31 @@ async function browserSignIn(session) {
 // browser is asked over its debugging port, which can take seconds on a busy
 // machine - so an answer is reused for a while instead of on every request, and
 // a request that came back unauthorized drops it at once: a sign-in that has
-// been renewed in the browser is then picked up on the very next request.
+// been renewed in the browser is then picked up on the very next request. The
+// reuse is keyed by the browser profile the sign-in names, and only the fields
+// the browser answers for are taken from it: two accounts on the same machine
+// share one read without sharing each other's workspace.
 export function browserReader(session, windowMs) {
   let last
+  const identity = (auth) => `${auth.metadata.browser}\u0000${typeof auth.metadata.profile === "string" ? auth.metadata.profile : ""}`
+  const withFound = (auth, found) => ({
+    ...auth,
+    key: found.cookie,
+    metadata: { ...auth.metadata, browser: found.browser, profile: found.profile, ...(found.via ? { via: found.via } : {}), ...(found.activeUserId ? { activeUserId: found.activeUserId } : {}) },
+  })
   return {
     async read(auth) {
       if (typeof auth?.metadata?.browser !== "string") return auth
-      if (last && Date.now() - last.at < windowMs) return last.auth
+      if (last && last.identity === identity(auth) && Date.now() - last.at < windowMs) return withFound(auth, last.found)
       try {
         const found = await session.findSession()
-        last = {
-          at: Date.now(),
-          auth: {
-            ...auth,
-            key: found.cookie,
-            metadata: { ...auth.metadata, browser: found.browser, profile: found.profile, ...(found.via ? { via: found.via } : {}), ...(found.activeUserId ? { activeUserId: found.activeUserId } : {}) },
-          },
-        }
-        return last.auth
-      } catch {
-        return auth
+        last = { at: Date.now(), identity: identity(auth), found }
+        return withFound(auth, found)
+      } catch (error) {
+        // The saved session stays the fallback, and the reason the browser could
+        // not be read is kept where a caller can see it instead of vanishing.
+        const message = error instanceof Error ? error.message : "the Notion session in this machine's browser could not be read"
+        return { ...auth, metadata: { ...auth.metadata, lastReadError: message } }
       }
     },
     forget() {
@@ -247,9 +265,8 @@ export function createPlugin(protocol, options = {}) {
               scope.signal.throwIfAborted()
               const auth = await reader.read(await getAuth())
               const events = await protocol.open({ auth, chat, signal: scope.signal })
-              const chunks = completionChunks(events, chat.model, scope.signal)
-              if (chat.stream) return streamResponse(chunks, scope.close)
-              try { return await bufferedResponse(chunks) } finally { scope.close() }
+              if (chat.stream) return streamResponse(completionChunks(events, chat.model, scope.signal), scope.close)
+              try { return await bufferedResponse(events, chat.model, scope.signal) } finally { scope.close() }
             } catch (error) {
               if (scope?.signal.aborted && scope.signal.reason instanceof ProviderError) error = scope.signal.reason
               scope?.close()

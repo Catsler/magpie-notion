@@ -278,3 +278,37 @@ test("quota V2: service period start does not imply a guessed end or reset", asy
   expect(result.until).toBeUndefined()
   for (const window of result.windows ?? []) expect(window.resetsAt).toBeUndefined()
 })
+
+test("quota: a readable allowance stands in for an unreadable top-level window", async () => {
+  const data = {
+    status: "within_limit",
+    window: { window: "6h" },
+    billingPeriodWindow: { window: "month" },
+    allowances: [
+      { cadence: "rolling", state: "resolved", used: 1, limit: 100, window: "6h", resetsInSeconds: 60 },
+      { cadence: "billing_period", state: "resolved", used: 2, limit: 100, periodEndMs: 1794841200000 },
+    ],
+  }
+  const { result } = await usage(data)
+  expect(result.error).toBeFalsy()
+  expect(result.windows).toHaveLength(2)
+  expect(result.windows.map((w) => w.used).sort((a, b) => a - b)).toEqual([1, 2])
+  expect(result.windows.find((w) => w.used === 1).resetSecs).toBe(60)
+  expect(result.windows.find((w) => w.used === 2).resetsAt).toBe(new Date(1794841200000).toISOString())
+  // A window whose numbers do not read is the same as one that is not there:
+  // the readable bucket below it is used instead.
+  const zeroLimit = singleWindow({ used: 5, limit: 0 })
+  zeroLimit.allowances = [{ cadence: "rolling", state: "resolved", used: 5, limit: 100, window: "6h" }]
+  const fallback = await usage(zeroLimit)
+  expect(fallback.result.windows).toHaveLength(1)
+  expect(fallback.result.windows[0].used).toBe(5)
+})
+
+test("quota: a response that reads no window at all is an error, not an empty account", async () => {
+  for (const payload of [{}, { status: "within_limit" }, { status: "within_limit", window: {} }]) {
+    const { result } = await usage(payload)
+    expect(result.error).toBe("Notion AI returned an unsupported quota response.")
+    expect(result.windows ?? []).toEqual([])
+    expect(result.signIn).not.toBe("expired")
+  }
+})

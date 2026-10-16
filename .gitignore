@@ -2,6 +2,9 @@ node_modules/
 dist/
 coverage/
 *.log
+plugin-auth.json
+*.har
+.env*
 .DS_Store
 Thumbs.db
 .idea/

@@ -1,6 +1,6 @@
 {
   "name": "opencode-notion-auth",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Notion AI (Business) as a magpie / OpenCode provider: sign in with your own Notion web session, use the workspace's live Notion AI model catalog, and see the plan's credit windows.",
   "type": "module",
   "main": "./index.mjs",
@@ -8,6 +8,7 @@
   "license": "MIT",
   "scripts": {
     "check": "node check.mjs",
+    "secrets": "node scripts/check-secrets.mjs",
     "test": "bun test"
   },
   "engines": {
@@ -32,8 +33,7 @@
     "transcript.mjs"
   ],
   "magpie": {
-    "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCIgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0Ij48cmVjdCB3aWR0aD0iNjQiIGhlaWdodD0iNjQiIHJ4PSIxNCIgZmlsbD0iIzFmMjkzNyIvPjxwYXRoIGQ9Ik0yMCAxNGgxN2w5IDl2MjVhNCA0IDAgMCAxLTQgNEgyMGE0IDQgMCAwIDEtNC00VjE4YTQgNCAwIDAgMSA0LTRaIiBmaWxsPSIjZjhmYWZjIi8+PHBhdGggZD0iTTM3IDE0djdhMyAzIDAgMCAwIDMgM2g2IiBmaWxsPSJub25lIiBzdHJva2U9IiMxZjI5MzciIHN0cm9rZS13aWR0aD0iMyIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPjxwYXRoIGQ9Ik0yMyAzM2gxMU0yMyA0MWgxNCIgc3Ryb2tlPSIjMTBiOTgxIiBzdHJva2Utd2lkdGg9IjQiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPjwvc3ZnPg==",
-    "maxConcurrency": 2
+    "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCIgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0Ij48cmVjdCB3aWR0aD0iNjQiIGhlaWdodD0iNjQiIHJ4PSIxNCIgZmlsbD0iIzFmMjkzNyIvPjxwYXRoIGQ9Ik0yMCAxNGgxN2w5IDl2MjVhNCA0IDAgMCAxLTQgNEgyMGE0IDQgMCAwIDEtNC00VjE4YTQgNCAwIDAgMSA0LTRaIiBmaWxsPSIjZjhmYWZjIi8+PHBhdGggZD0iTTM3IDE0djdhMyAzIDAgMCAwIDMgM2g2IiBmaWxsPSJub25lIiBzdHJva2U9IiMxZjI5MzciIHN0cm9rZS13aWR0aD0iMyIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPjxwYXRoIGQ9Ik0yMyAzM2gxMU0yMyA0MWgxNCIgc3Ryb2tlPSIjMTBiOTgxIiBzdHJva2Utd2lkdGg9IjQiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPjwvc3ZnPg=="
   },
   "repository": {
     "type": "git",

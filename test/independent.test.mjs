@@ -381,3 +381,73 @@ test("total request timeout aborts a stalled upstream with a sanitized 504", asy
   expect(response.status).toBe(504)
   expect((await response.json()).error.code).toBe("request_timeout")
 })
+
+test("a committed answer shorter than the provisional text is not a failure", async () => {
+  mockNotion({ handle: (name) => name === "listenToThreadTranscript" ? ndjson([
+    frame(message("Hello world, this is the provisional stream", 1, "provisional")),
+    frame({ op: "remove", id: "provisional" }, message("Hello", 1, "committed"), done(2)),
+  ]) : undefined })
+  const response = await request(chat())
+  expect(response.status).toBe(200)
+  // The committed message is the answer, even though the provisional text that
+  // was streamed before it was longer.
+  expect((await response.json()).choices[0].message.content).toBe("Hello")
+})
+
+test("a shorter committed answer keeps the stream that was already sent intact", async () => {
+  mockNotion({ handle: (name) => name === "listenToThreadTranscript" ? ndjson([
+    frame(message("Hello world, this is the provisional stream", 1, "provisional")),
+    frame({ op: "remove", id: "provisional" }, message("Hello", 1, "committed"), done(2)),
+  ]) : undefined })
+  const response = await request(chat(undefined, { stream: true }))
+  const text = await response.text()
+  expect(response.status).toBe(200)
+  expect(text).toContain("Hello world, this is the provisional stream")
+  expect(text).not.toContain('"error"')
+  expect(text).toContain("[DONE]")
+})
+
+test("a turn that ends without text is reported, not answered with nothing", async () => {
+  const silent = frame({ op: "put", entity: { id: "assistant", kind: "assistant_message", sequence: 1, content: [{ type: "tool_use", id: "call" }] } }, done(2))
+  for (const stream of [false, true]) {
+    mockNotion({ handle: (name) => name === "listenToThreadTranscript" ? ndjson([silent]) : undefined })
+    const response = await request(chat(undefined, { stream }))
+    const text = await response.text()
+    expect(response.status).toBe(stream ? 200 : 502)
+    expect(text).toContain("empty_answer")
+    expect(text).not.toContain("[DONE]")
+  }
+})
+
+test("a burst of small frames in one read is not one oversized frame", async () => {
+  const burst = '{"type":"keepalive"}\n'.repeat(210_000)
+  const body = new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(burst)); c.close() } })
+  const frames = await collect(readNDJSON(body))
+  expect(frames).toHaveLength(210_000)
+})
+
+test("a single frame over the frame limit is refused", async () => {
+  const body = new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(`{"type":"keepalive","pad":"${"a".repeat(4 * 1024 * 1024)}"}\n`)); c.close() } })
+  await expect(collect(readNDJSON(body))).rejects.toMatchObject({ code: "transcript_frame_too_large" })
+})
+
+test("a long answer is decoded without rebuilding the whole message each frame", async () => {
+  async function* stream() {
+    yield frame(message("a", 1, "assistant"))
+    for (let index = 0; index < 100_000; index++) yield frame({ op: "patch", id: "assistant", ops: [{ op: "append", path: "/content/0/text", value: "x" }] })
+    yield frame(done(2))
+  }
+  const started = performance.now()
+  const events = await collect(transcriptEvents(stream()))
+  const elapsed = performance.now() - started
+  expect(events.at(-1)).toMatchObject({ type: "done", text: "a" + "x".repeat(100_000) })
+  // Rebuilding on every frame took seconds at this size; decoding must stay
+  // proportional to the fragments it is handed.
+  expect(elapsed).toBeLessThan(4000)
+})
+
+test("a model without an id is never published", async () => {
+  mockNotion({ handle: (name) => name === "getAvailableModels" ? Response.json({ models: [{ ...model, model: "" }, model] }) : undefined })
+  const models = await protocol.models({ auth })
+  expect(Object.keys(models)).toEqual([model.model])
+})

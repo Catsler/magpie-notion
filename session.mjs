@@ -58,12 +58,18 @@ export function browserStores(options = {}) {
     if (!existsSync(root)) continue
     const localState = join(root, "Local State")
     let profiles = []
+    let lastUsed
     try {
-      profiles = Object.keys(JSON.parse(readFileSync(localState, "utf8"))?.profile?.info_cache ?? {})
+      const state = JSON.parse(readFileSync(localState, "utf8"))
+      profiles = Object.keys(state?.profile?.info_cache ?? {})
+      if (typeof state?.profile?.last_used === "string") lastUsed = state.profile.last_used
     } catch {
       profiles = []
     }
     if (!profiles.length) profiles = ["Default"]
+    // The profile the browser last used is the one most likely to hold the
+    // sign-in, and the information is already there for the taking.
+    if (lastUsed && profiles.includes(lastUsed) && profiles[0] !== lastUsed) profiles = [lastUsed, ...profiles.filter((profile) => profile !== lastUsed)]
     for (const profile of profiles) {
       for (const relative of [["Network", "Cookies"], ["Cookies"]]) {
         const db = join(root, profile, ...relative)
@@ -109,6 +115,10 @@ function chromiumRoots(platform, env, home) {
     { browser: "Chromium", root: join(config, "chromium") },
     { browser: "Edge", root: join(config, "microsoft-edge") },
     { browser: "Brave", root: join(config, "BraveSoftware", "Brave-Browser") },
+    // Flatpak and Snap keep their profiles outside the configuration directory.
+    { browser: "Chrome", root: join(home, ".var", "app", "com.google.Chrome", "config", "google-chrome") },
+    { browser: "Brave", root: join(home, ".var", "app", "com.brave.Browser", "config", "BraveSoftware", "Brave-Browser") },
+    { browser: "Chromium", root: join(home, "snap", "chromium", "current", ".config", "chromium") },
   ]
 }
 
@@ -136,14 +146,15 @@ export async function findSession(options = {}) {
     const where = `${store.browser} (${store.profile})`
     try {
       const cookies = await readStore(store, options)
-      const session = cookies.find((cookie) => cookie.name === "token_v2" && cookie.value)
+      const best = bestCookies(cookies)
+      const session = best.find((cookie) => cookie.name === "token_v2")
       if (!session) {
         problems.push(`${where} has no Notion session`)
         continue
       }
-      const user = cookies.find((cookie) => cookie.name === "notion_user_id")
+      const user = best.find((cookie) => cookie.name === "notion_user_id")
       return {
-        cookie: cookieHeader(cookies),
+        cookie: cookieHeader(best),
         browser: store.browser,
         profile: store.profile,
         ...(UUID.test(user?.value ?? "") ? { activeUserId: user.value } : {}),
@@ -180,13 +191,14 @@ export async function findDevtoolsSession(options = {}) {
     try {
       const cookies = (await (options.connect ?? connectDevtools)(endpoint, options.devtoolsTimeout ?? DEVTOOLS_TIMEOUT))
         .filter((cookie) => NAMES.includes(cookie?.name) && notionHost(cookie?.domain) && cookie.value)
-      if (!cookies.some((cookie) => cookie.name === "token_v2")) {
+      const best = bestCookies(cookies)
+      if (!best.some((cookie) => cookie.name === "token_v2")) {
         problems.push(`${where} is signed in to no Notion account`)
         continue
       }
-      const user = cookies.find((cookie) => cookie.name === "notion_user_id")
+      const user = best.find((cookie) => cookie.name === "notion_user_id")
       return {
-        cookie: cookieHeader(cookies),
+        cookie: cookieHeader(best),
         browser: named.browser,
         profile: named.profile,
         via: "devtools",
@@ -235,7 +247,7 @@ async function connectDevtools(endpoint, timeout) {
 
 function askDevtools(endpoint, timeout) {
   return new Promise((resolve, reject) => {
-    if (typeof WebSocket !== "function") return reject(new SessionError("this runtime cannot open a browser's debugging port", "unsupported-encryption"))
+    if (typeof WebSocket !== "function") return reject(new SessionError("this runtime cannot open a browser's debugging port", "unsupported-runtime"))
     let socket
     try { socket = new WebSocket(endpoint) } catch { return reject(new SessionError("the browser's debugging port could not be opened", "devtools")) }
     let settled = false
@@ -259,19 +271,40 @@ function askDevtools(endpoint, timeout) {
   })
 }
 
-// cookieHeader is the Cookie request header the web client would send: the
-// Notion cookies the store holds, in the order they were found.
-export function cookieHeader(cookies) {
-  const seen = new Set()
-  const parts = []
+// notionPriority ranks the domains a Notion cookie can come from. The web
+// client's session lives on app.notion.com; cookie rows from the older
+// notion.so site can still be beside it, and two values for one name must
+// never both be sent, since nothing would say which one wins.
+function notionPriority(host) {
+  const value = String(host ?? "").toLowerCase().replace(/^\./, "")
+  if (value === "app.notion.com") return 0
+  if (value === "notion.com" || value.endsWith(".notion.com")) return 1
+  return 2
+}
+
+// bestCookies keeps one cookie per name - the one from the domain closest to
+// the web client - in the order the names were first found.
+export function bestCookies(cookies) {
+  const chosen = new Map()
   for (const cookie of cookies) {
     if (!cookie?.name || !cookie.value) continue
-    const key = `${cookie.name}=${cookie.value}`
-    if (seen.has(key)) continue
-    seen.add(key)
-    parts.push(key)
+    const best = chosen.get(cookie.name)
+    if (!best || notionPriority(cookie.host ?? cookie.domain) < notionPriority(best.host ?? best.domain)) chosen.set(cookie.name, cookie)
   }
-  return parts.join("; ")
+  const emitted = new Set()
+  const result = []
+  for (const cookie of cookies) {
+    if (!chosen.has(cookie?.name) || emitted.has(cookie.name)) continue
+    emitted.add(cookie.name)
+    result.push(chosen.get(cookie.name))
+  }
+  return result
+}
+
+// cookieHeader is the Cookie request header the web client would send: the
+// Notion cookies the store holds, once per name, in the order they were found.
+export function cookieHeader(cookies) {
+  return bestCookies(cookies).map((cookie) => `${cookie.name}=${cookie.value}`).join("; ")
 }
 
 async function readStore(store, options) {
@@ -285,7 +318,16 @@ async function readStore(store, options) {
       const cookies = []
       for (const row of rows) {
         if (!notionHost(row.host) || !NAMES.includes(row.name)) continue
-        const value = store.kind === "firefox" ? String(row.value ?? "") : decryptValue(toBuffer(row.encrypted_value), key, options)
+        let value
+        try {
+          value = store.kind === "firefox" ? String(row.value ?? "") : decryptValue(toBuffer(row.encrypted_value), key, options)
+        } catch (error) {
+          // One row this build cannot open - a v20 value beside v10 ones - must
+          // not throw away the rows that did open. Only the session itself is
+          // allowed to fail the whole store.
+          if (row.name === "token_v2") throw error
+          continue
+        }
         if (value) cookies.push({ name: row.name, value, host: row.host })
       }
       return cookies
@@ -299,13 +341,27 @@ async function readStore(store, options) {
 
 // discard removes a copy the reader is done with. A browser, an indexer or an
 // antivirus can hold a file for a moment longer; failing to take a copy back is
-// never a reason for a sign-in to fail, so the attempt ends quietly.
+// never a reason for a sign-in to fail, so a failed attempt is retried in the
+// background instead of leaving the session copy on disk for good.
 function discard(directory) {
-  try {
-    rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
-  } catch {
-    // The system's own temporary-directory cleanup will take it.
+  const attempt = () => {
+    try {
+      rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
+      return true
+    } catch {
+      return false
+    }
   }
+  if (attempt()) return true
+  let tries = 0
+  const retry = () => {
+    if (attempt() || ++tries >= 10) return
+    const timer = setTimeout(retry, 1000)
+    timer.unref?.()
+  }
+  const timer = setTimeout(retry, 250)
+  timer.unref?.()
+  return false
 }
 
 function toBuffer(value) {
@@ -393,24 +449,33 @@ async function dpapi(blob, run) {
   return { cipher: "gcm", key }
 }
 
+// The name each desktop files a browser's cookie key under: the product name in
+// the macOS keychain, the package's application name for secret-tool on Linux.
+// Neither is the browser's display name, and asking under the wrong one either
+// finds nothing or finds another browser's key.
+const SAFE_STORAGE = {
+  Chrome: { darwin: "Chrome Safe Storage", linux: "chrome" },
+  Chromium: { darwin: "Chromium Safe Storage", linux: "chromium" },
+  Brave: { darwin: "Brave Safe Storage", linux: "brave" },
+  Edge: { darwin: "Microsoft Edge Safe Storage", linux: "microsoft-edge" },
+}
+
 async function keychainSecret(store, run) {
+  const service = SAFE_STORAGE[store.browser]?.darwin ?? `${store.browser} Safe Storage`
   try {
-    return (await run("/usr/bin/security", ["find-generic-password", "-w", `${store.browser} Safe Storage`])).trim()
+    return (await run("/usr/bin/security", ["find-generic-password", "-w", service])).trim()
   } catch {
     return ""
   }
 }
 
 async function secretServiceKey(store, run) {
-  for (const application of [store.browser.toLowerCase(), "chromium", "chrome"]) {
-    try {
-      const secret = (await run("secret-tool", ["lookup", "application", application])).trim()
-      if (secret) return secret
-    } catch {
-      // The next application name, then no key at all.
-    }
+  const application = SAFE_STORAGE[store.browser]?.linux ?? store.browser.toLowerCase()
+  try {
+    return (await run("secret-tool", ["lookup", "application", application])).trim()
+  } catch {
+    return ""
   }
-  return ""
 }
 
 // decryptValue opens one Chromium cookie value: "v10"/"v11" as Windows and the

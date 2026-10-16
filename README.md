@@ -122,8 +122,9 @@ not zero, and a missing reset stays missing instead of being inferred from a
 window's span. `getAIUsageEligibilityV2` adds the premium credit balance when
 the workspace exposes it; a metadata error or missing field there never hides
 the standard windows. An HTTP 401 on the quota read marks the sign-in
-`expired`; other failures are sanitized errors. Neither the session cookie,
-the workspace UUID nor raw upstream bodies appear in the result.
+`expired`; other failures are sanitized errors, and a response that reads no
+window at all is an error rather than an empty account. Neither the session
+cookie, the workspace UUID nor raw upstream bodies appear in the result.
 
 ## Conversation behavior and limitations
 
@@ -132,8 +133,12 @@ network requests go only to `https://app.notion.com/api/v3/` through the adapter
 It creates a Notion personal-agent thread and reads its transcript page before
 following the live NDJSON stream. Both buffered Chat Completions JSON and SSE
 output are supported. Provisional assistant-message updates are deduplicated
-when Notion replaces them with their committed version. An explicit successful
-turn-completion event is required; EOF is never treated as success.
+when Notion replaces them with their committed version. When a committed
+message turns out shorter than provisional text that was already streamed, the
+committed message stays the answer: a buffered response reports it, and bytes
+already sent over SSE cannot be taken back. A turn that completes without any
+text is an error, not an empty answer. An explicit successful turn-completion
+event is required; EOF is never treated as success.
 
 The initial conversation is serialized into a text wrapper containing role
 labels. This is **not native system/developer role isolation**. Subsequent

@@ -153,3 +153,15 @@ test("the workspace the models answer for wins over a candidate that answers lat
   await asked(AbortSignal.timeout(5_000))
   expect(mock.calls.filter((call) => call.name === "getAvailableModels").map((call) => call.data.spaceId)).toEqual([SPACE])
 })
+
+test("a workspace or user saved as blank is discovered, not refused", async () => {
+  const mock = mockNotion()
+  const blank = { type: "api", key: auth.key, metadata: { spaceId: "", activeUserId: "" } }
+  for await (const event of await protocol.open({ auth: blank, chat, signal: AbortSignal.timeout(5_000) })) void event
+  expect(mock.names()).toContain("getSpaces")
+  expect(mock.calls.find((call) => call.name === "createAgentThread").data.spaceId).toBe(SPACE)
+  expect(internals.credentials(blank)).toMatchObject({ spaceId: undefined, activeUserId: undefined })
+  expect(internals.credentials({ type: "api", key: auth.key, metadata: { spaceId: null, activeUserId: null } })).toMatchObject({ spaceId: undefined, activeUserId: undefined })
+  // A value that is present but not a UUID is still refused before any request.
+  expect(() => internals.credentials({ type: "api", key: auth.key, metadata: { spaceId: "not-a-uuid" } })).toThrow()
+})
