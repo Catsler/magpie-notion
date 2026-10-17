@@ -1,6 +1,6 @@
 # magpie-notion
 
-版本：0.2.5
+版本：1.0.0
 
 `magpie-notion` 是一个把 Notion AI 接入 Magpie / OpenCode 的非官方插件。它使用
 Notion 网页客户端所调用的内部接口，不是 Notion 的公开 Integration API；Notion
