@@ -300,9 +300,40 @@ test("incoming credentials are not forwarded, and safe agent settings are presen
   expect(mock.calls.find((v) => v.name === "createAgentThread").data).toMatchObject({ policies: { approval_mode: "ask", disable_internet_access: true, disable_computer_file_downloads: true }, agentMemorySettings: { useMemories: false, excludeChatFromMemories: true }, browserEnabled: false })
 })
 
-test.each([{ tools: [{ type: "function" }] }, { messages: [{ role: "tool", content: "tool" }] }, { messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "secret" } }] }] }])("unsupported tools and images fail before network", async (input) => {
+test("client tool declarations are dropped and the text request still completes", async () => {
   const mock = mockNotion()
-  expect((await request(chat(undefined, input))).status).toBe(400)
+  const response = await request(chat([{ role: "user", content: "Hello" }], {
+    tools: [{ type: "function", function: { name: "shell", parameters: { secret_schema: true } } }],
+    tool_choice: "required",
+    functions: [{ name: "legacy" }],
+    function_call: "auto",
+  }))
+  expect(response.status).toBe(200)
+  const created = mock.calls.find((call) => call.name === "createAgentThread")
+  const sent = JSON.stringify(created.data)
+  expect(sent).toContain("Hello")
+  expect(sent).not.toContain("shell")
+  expect(sent).not.toContain("secret_schema")
+  expect(sent).not.toContain("legacy")
+})
+
+test("earlier tool calls and results are kept as text", async () => {
+  const mock = mockNotion()
+  const response = await request(chat([
+    { role: "user", content: "Run it" },
+    { role: "assistant", content: null, tool_calls: [{ type: "function", function: { name: "shell", arguments: "{\"cmd\":\"ls\"}" } }] },
+    { role: "tool", name: "shell", content: "file.txt" },
+  ]))
+  expect(response.status).toBe(200)
+  const sent = JSON.stringify(mock.calls.find((call) => call.name === "createAgentThread").data)
+  expect(sent).toContain("file.txt")
+  expect(sent).toContain("shell")
+  expect(sent).toContain("ls")
+})
+
+test("images still fail before network", async () => {
+  const mock = mockNotion()
+  expect((await request(chat(undefined, { messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "secret" } }] }] }))).status).toBe(400)
   expect(mock.calls).toHaveLength(0)
 })
 
@@ -310,7 +341,7 @@ test("package entry exports only the plugin and all declared runtime files exist
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url)))
   const plugin = await NotionPlugin()
   expect(Object.keys(await import("../index.mjs"))).toEqual(["NotionPlugin"])
-  expect(pkg).toMatchObject({ name: "magpie-notion", version: "1.0.0" })
+  expect(pkg).toMatchObject({ name: "magpie-notion", version: "1.0.1" })
   expect(pkg.description).toContain("token_v2")
   expect(plugin.auth.provider).toBe("notion")
   expect(plugin.auth.methods).toEqual([{ type: "api", label: "粘贴 token_v2", placeholder: "只粘贴 token_v2" }])

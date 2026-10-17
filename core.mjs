@@ -27,27 +27,45 @@ function errorResponse(error) {
 
 function text(content) {
   if (typeof content === "string") return content
+  if (content == null) return ""
   if (Array.isArray(content) && content.every((part) => part?.type === "text" && typeof part.text === "string")) return content.map((part) => part.text).join("")
   throw new ProviderError(400, "unsupported_content", "This Notion adapter currently accepts text messages only.")
 }
 
+function callText(call) {
+  const name = typeof call?.function?.name === "string" ? call.function.name : (typeof call?.name === "string" ? call.name : "tool")
+  const args = call?.function?.arguments ?? call?.arguments
+  const rendered = typeof args === "string" ? args : args == null ? "" : JSON.stringify(args)
+  return rendered ? name + " " + rendered : name
+}
+
+// Client tools are not executed. Agents attach them to every request, so they
+// are removed and any earlier tool result is kept as plain text.
 function parseChat(body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) throw new ProviderError(400, "invalid_request", "Expected a JSON chat request.")
   if (typeof body.model !== "string" || !body.model.trim()) throw new ProviderError(400, "invalid_model", "A verified workspace model id is required.")
   if (body.stream !== undefined && typeof body.stream !== "boolean") throw new ProviderError(400, "invalid_stream", "stream must be a boolean.")
   if (body.n !== undefined && body.n !== 1) throw new ProviderError(400, "unsupported_parameter", "Only one completion is supported.")
-  if ((body.tools?.length ?? 0) || (body.functions?.length ?? 0) || (body.tool_choice !== undefined && body.tool_choice !== "none") || (body.function_call !== undefined && body.function_call !== "none")) {
-    throw new ProviderError(400, "unsupported_tools", "Notion tool calling has not been verified and is not supported by this adapter.")
-  }
   if (!Array.isArray(body.messages) || !body.messages.length) throw new ProviderError(400, "invalid_messages", "At least one message is required.")
   const messages = body.messages.map((message) => {
-    if (!message || !["system", "developer", "user", "assistant"].includes(message.role) || message.tool_calls?.length || message.function_call) {
+    if (!message || typeof message.role !== "string") throw new ProviderError(400, "unsupported_message", "Only text system, developer, user and assistant messages are supported.")
+    if (message.role === "tool" || message.role === "function") {
+      const name = typeof message.name === "string" && message.name.trim() ? message.name.trim() : "tool"
+      const result = message.content != null && typeof message.content === "object" && !Array.isArray(message.content) ? JSON.stringify(message.content) : text(message.content)
+      return { role: "user", content: result ? "[" + name + "]\n" + result : "[" + name + "]" }
+    }
+    if (!["system", "developer", "user", "assistant"].includes(message.role)) {
       throw new ProviderError(400, "unsupported_message", "Only text system, developer, user and assistant messages are supported.")
     }
-    return { role: message.role, content: text(message.content) }
+    const calls = [...(Array.isArray(message.tool_calls) ? message.tool_calls : []), ...(message.function_call ? [message.function_call] : [])]
+    const note = calls.map(callText).filter(Boolean).join("\n")
+    const content = text(message.content)
+    return { role: message.role, content: content && note ? content + "\n" + note : content || note }
   })
-  return { ...body, messages }
+  const { tools, functions, tool_choice, function_call, ...rest } = body
+  return { ...rest, messages }
 }
+
 
 // These events are an adapter contract, not a claim about Notion's wire format.
 // A decoder must yield text deltas and one explicit done; EOF alone is a failure.
