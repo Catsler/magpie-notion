@@ -6,8 +6,10 @@ import { NotionPlugin } from "../index.mjs"
 // follow https://usemagpie.ai/docs/plugins#usage, not CodexBar UI fields.
 const realFixture = JSON.parse(readFileSync(new URL("../fixtures/real-quota.json", import.meta.url)))
 const realFetch = globalThis.fetch
-const auth = { type: "api", key: "notion_test_session=offline-only", metadata: { spaceId: "11111111-1111-4111-8111-111111111111", activeUserId: "22222222-2222-4222-8222-222222222222" } }
+const token = "offline-token-v2"
+const auth = { type: "api", key: token, metadata: { spaceId: "11111111-1111-4111-8111-111111111111", activeUserId: "22222222-2222-4222-8222-222222222222" } }
 const copy = () => structuredClone(realFixture)
+const cookieValue = (header, name) => header.split(";").map((part) => part.trim()).find((part) => part.startsWith(name + "="))?.slice(name.length + 1)
 const premiumFixture = {
   basicCredits: { userLimit: 50, userUsage: 1 },
   premiumCredits: {
@@ -166,7 +168,7 @@ test("quota: requests use the selected account and workspace without logging the
   expect(call.url).toBe("https://app.notion.com/api/v3/getCreditRateLimitStatus")
   expect(call.method).toBe("POST")
   expect(JSON.parse(call.body).spaceId).toBe(auth.metadata.spaceId)
-  expect(call.headers.Cookie.startsWith(auth.key)).toBe(true)
+  expect(cookieValue(call.headers.Cookie, "token_v2")).toBe(token)
   expect(call.headers.Cookie).toContain("notion_users=" + encodeURIComponent(JSON.stringify([auth.metadata.activeUserId])))
   expect(call.headers["x-notion-space-id"]).toBe(auth.metadata.spaceId)
   expect(call.headers["x-notion-active-user-header"]).toBe(auth.metadata.activeUserId)
@@ -185,12 +187,12 @@ test("quota: HTTP 401 marks the session expired with no upstream diagnostic", as
 
 test("quota: consecutive accounts do not share usage or identity state", async () => {
   const first = await usage(singleWindow({ used: 12, limit: 100 }))
-  const otherAuth = { ...auth, key: "other-offline-session", metadata: { ...auth.metadata, spaceId: "33333333-3333-4333-8333-333333333333" } }
+  const otherAuth = { ...auth, key: "other-" + token, metadata: { ...auth.metadata, spaceId: "33333333-3333-4333-8333-333333333333" } }
   const second = await usage(singleWindow({ used: 73, limit: 100 }), { auth: otherAuth })
   expect(first.result.windows[0].used).toBe(12)
   expect(second.result.windows[0].used).toBe(73)
   const otherCookie = second.calls.find((c) => c.name === "getCreditRateLimitStatus").headers.Cookie
-  expect(otherCookie.startsWith(otherAuth.key)).toBe(true)
+  expect(cookieValue(otherCookie, "token_v2")).toBe(otherAuth.key)
   expect(otherCookie).toContain("notion_users=" + encodeURIComponent(JSON.stringify([otherAuth.metadata.activeUserId])))
 })
 
@@ -234,7 +236,7 @@ test("quota V2: actual 300-credit balance is independent from standard allowance
   expect(result.windows.map((w) => w.used).sort((a, b) => a - b)).toEqual([0.01, 0.03])
   const call = calls.find((c) => c.name === "getAIUsageEligibilityV2")
   expect(JSON.parse(call.body).spaceId).toBe(auth.metadata.spaceId)
-  expect(call.headers.Cookie.startsWith(auth.key)).toBe(true)
+  expect(cookieValue(call.headers.Cookie, "token_v2")).toBe(token)
   expect(call.headers.Cookie).toContain("notion_users=" + encodeURIComponent(JSON.stringify([auth.metadata.activeUserId])))
 })
 

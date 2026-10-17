@@ -89,11 +89,23 @@ async function request(name, url, init) {
   }
 }
 
+// Accept either the token value by itself or a Cookie header the user pasted by
+// mistake. Only token_v2 is kept, so unrelated pasted cookies never reach the
+// upstream request.
 function cookie(auth) {
-  if (auth?.type !== "api" || typeof auth.key !== "string" || !auth.key.trim() || /[\r\n]/.test(auth.key)) {
-    throw new ProviderError(401, "session_required", "Sign in with the Notion web session's Cookie header.")
+  const reject = () => new ProviderError(401, "session_required", "请粘贴 Notion 的 token_v2。")
+  if (auth?.type !== "api" || typeof auth.key !== "string" || /[\r\n]/.test(auth.key)) throw reject()
+  const pasted = auth.key.trim().replace(/^Cookie\s*:\s*/i, "")
+  if (!pasted) throw reject()
+  const field = cookieFields(pasted).find((entry) => entry.name === "token_v2")
+  if (field) {
+    const token = field.value?.trim()
+    if (!token) throw reject()
+    return `token_v2=${token}`
   }
-  return auth.key.trim()
+  // A Cookie header without token_v2 is not a token, even when it has one field.
+  if (pasted.includes("=") || pasted.includes(";")) throw reject()
+  return `token_v2=${pasted}`
 }
 
 // A field the sign-in left blank is not a value: an unanswered optional prompt
@@ -105,10 +117,9 @@ function optional(value) {
   return value
 }
 
-// credentials reads what the sign-in states: the Cookie header, and the
-// workspace and user where the account carries them. The workspace is not
-// required: an account without one has it resolved from the session itself, so
-// nobody has to type a UUID.
+// credentials reads the pasted token and the workspace/user metadata where the
+// account carries them. The workspace is not required: an account without one
+// has it resolved from the session itself, so nobody has to type a UUID.
 function credentials(auth) {
   const key = cookie(auth)
   const metadata = auth?.metadata ?? {}

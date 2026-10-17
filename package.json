@@ -1,7 +1,7 @@
 {
-  "name": "opencode-notion-auth",
-  "version": "0.2.3",
-  "description": "Notion AI (Business) as a magpie / OpenCode provider: sign in with your own Notion web session, use the workspace's live Notion AI model catalog, and see the plan's credit windows.",
+  "name": "magpie-notion",
+  "version": "0.2.4",
+  "description": "Magpie / OpenCode 的 Notion AI 插件：登录时只粘贴自己的 token_v2，工作区自动发现。",
   "type": "module",
   "main": "./index.mjs",
   "exports": "./index.mjs",

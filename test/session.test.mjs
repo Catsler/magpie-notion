@@ -4,7 +4,7 @@ import { createCipheriv, pbkdf2Sync, randomBytes } from "node:crypto"
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { delimiter, join } from "node:path"
-import { browserReader, createPlugin } from "../core.mjs"
+import { createPlugin } from "../core.mjs"
 import protocol from "../protocol.mjs"
 import { SessionError, bestCookies, browserStores, cookieHeader, copyToTemporary, decryptValue, findDevtoolsSession, findSession, _internal } from "../session.mjs"
 
@@ -505,103 +505,9 @@ test("a debugging port that never opens has a short connection limit", async () 
   }
 })
 
-test("the browser sign-in takes the session that is there, asking nothing", async () => {
-  const session = { findSession: async () => ({ cookie: `token_v2=live-session; notion_user_id=${USER}`, browser: "Edge", profile: "Default", activeUserId: USER }) }
-  const plugin = createPlugin(protocol, { session })
-  const method = plugin.auth.methods.find((entry) => entry.type === "oauth")
-  expect(method.label).toBe("Use the Notion session in this browser")
-  const start = await method.authorize()
-  expect(start).toMatchObject({ url: "", method: "auto" })
-  expect(typeof start.callback).toBe("function")
-  expect(await start.callback()).toEqual({ type: "success", key: `token_v2=live-session; notion_user_id=${USER}`, metadata: { browser: "Edge", profile: "Default", activeUserId: USER } })
-})
-
-test("a container sign-in opens the configured page and polls for the session", async () => {
-  const session = {
-    findSession: async () => {
-      reads++
-      if (reads < 3) throw new SessionError("No browser profile was found", "no-browser")
-      return { cookie: "synthetic-session", browser: "Chromium", profile: "Default", via: "devtools" }
-    },
-  }
-  let reads = 0
-  const plugin = createPlugin(protocol, {
-    session,
-    env: { MAGPIE_WEB_URL: "https://magpie.test/base/" },
-    signInPollMs: 1,
-    signInTimeoutMs: 200,
-  })
-  const method = plugin.auth.methods.find((entry) => entry.type === "oauth")
-  expect(method.prompts).toBeUndefined()
-  const start = await method.authorize()
-  expect(start).toMatchObject({
-    url: "https://magpie.test/base/notion-login/",
-    instructions: "Open the page, sign in to Notion in its browser, then wait here; this will continue automatically.",
-    method: "auto",
-  })
-  expect(await start.callback()).toEqual({
-    type: "success",
-    key: "synthetic-session",
-    metadata: { browser: "Chromium", profile: "Default", via: "devtools" },
-  })
-  expect(reads).toBe(3)
-})
-
-test("the direct sign-in address wins over the Magpie web address", async () => {
-  const session = { findSession: async () => { throw new SessionError("No browser profile was found", "no-browser") } }
-  const plugin = createPlugin(protocol, {
-    session,
-    env: { NOTION_SIGNIN_URL: "https://sign-in.test/notion", MAGPIE_WEB_URL: "https://magpie.test/base/" },
-    signInPollMs: 1,
-    signInTimeoutMs: 1,
-  })
-  const start = await plugin.auth.methods.find((entry) => entry.type === "oauth").authorize()
-  expect(start.url).toBe("https://sign-in.test/notion")
-})
-
-test("a container sign-in without a configured page fails readably and invents no address", async () => {
-  const session = { findSession: async () => { throw new SessionError("No Chrome, Edge, Brave, Chromium or Firefox profile was found", "no-browser") } }
-  const plugin = createPlugin(protocol, { session, env: {} })
-  const start = await plugin.auth.methods.find((entry) => entry.type === "oauth").authorize()
-  expect(start.url).toBe("")
-  expect(start.method).toBe("auto")
-  const result = await start.callback()
-  expect(result.type).toBe("failed")
-  expect(result.error).toContain("No Chrome, Edge, Brave, Chromium or Firefox profile")
-})
-
-test("a sign-in page gives the container browser a bounded time to finish", async () => {
-  const session = { findSession: async () => { throw new SessionError("No browser profile was found", "no-browser") } }
-  const plugin = createPlugin(protocol, {
-    session,
-    env: { MAGPIE_WEB_URL: "https://magpie.test/base" },
-    signInPollMs: 1,
-    signInTimeoutMs: 5,
-  })
-  const start = await plugin.auth.methods.find((entry) => entry.type === "oauth").authorize()
-  expect(start.url).toBe("https://magpie.test/base/notion-login/")
-  const result = await start.callback()
-  expect(result.type).toBe("failed")
-  expect(result.error).toContain("did not finish within 3 minutes")
-})
-
-test("a store this build cannot open fails the sign-in with the reason, not a generic error", async () => {
-  const session = { findSession: async () => { throw new SessionError("Chrome (Default): this store's cookies are bound to the browser (v20); paste the Cookie header instead", "unsupported-encryption") } }
-  const plugin = createPlugin(protocol, { session })
-  const result = await (await plugin.auth.methods.find((entry) => entry.type === "oauth").authorize()).callback()
-  expect(result.type).toBe("failed")
-  expect(result.error).toContain("v20")
-  expect(result.error).toContain("paste the Cookie header")
-})
-
-test("the manual method asks for the session only, and a blank workspace is allowed", async () => {
+test("the only sign-in method is a Chinese token_v2 paste field", async () => {
   const plugin = createPlugin(protocol, {})
-  const manual = plugin.auth.methods.find((entry) => entry.type === "api")
-  expect(manual.prompts.filter((prompt) => prompt.key === "spaceId").every((prompt) => prompt.validate("") === undefined)).toBe(true)
-  expect(manual.prompts.find((prompt) => prompt.key === "spaceId").validate("not-a-uuid")).toBeString()
-  expect(manual.prompts.find((prompt) => prompt.key === "activeUserId").validate("")).toBeUndefined()
-  expect(manual.prompts.find((prompt) => prompt.key === "activeUserId").validate("nope")).toBeString()
-  expect(manual.prompts.every((prompt) => prompt.type === "text")).toBe(true)
+  expect(plugin.auth.methods).toEqual([{ type: "api", label: "粘贴 token_v2", placeholder: "只粘贴 token_v2" }])
 })
 
 function mockNotion(handle) {
@@ -625,53 +531,15 @@ async function chat(plugin, auth) {
   return loader.fetch("https://notion.invalid/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: "test-model", stream: true, messages: [{ role: "user", content: "Hello" }] }) })
 }
 
-test("a request reads the browser again, and the saved session is the fallback", async () => {
+test("the pasted token is used directly and never reads a browser", async () => {
   const mock = mockNotion()
-  let reads = 0
-  const session = { findSession: async () => { reads++; return reads === 1 ? { cookie: "token_v2=live-one", browser: "Chrome", profile: "Default" } : (() => { throw new SessionError("Chrome is not running", "locked") })() } }
-  const plugin = createPlugin(protocol, { session, browserReadMs: 0 })
-  const kept = { type: "api", key: "token_v2=kept", metadata: { browser: "Chrome", profile: "Default", spaceId: UUID } }
-  expect((await chat(plugin, kept)).status).toBe(200)
-  expect((await chat(plugin, kept)).status).toBe(200)
-  expect(reads).toBe(2)
-  const cookies = mock.calls.filter((call) => call.name === "createAgentThread").map((call) => call.init.headers.Cookie)
-  expect(cookies.map((header) => cookieValue(header, "token_v2"))).toEqual(["live-one", "kept"])
-  expect(cookies.every((header) => UUID_PATTERN.test(cookieValue(header, "device_id")))).toBe(true)
-  globalThis.fetch = realFetch
-})
-
-test("a burst of requests reuses one browser read, and an unauthorized answer drops it", async () => {
-  let reads = 0
-  let expired = false
-  const mock = mockNotion((name) => (name === "createAgentThread" && expired ? Response.json({ message: "session expired" }, { status: 401 }) : undefined))
-  const session = { findSession: async () => { reads++; return { cookie: "token_v2=live", browser: "Chrome", profile: "Default" } } }
-  const plugin = createPlugin(protocol, { session })
-  const kept = { type: "api", key: "token_v2=kept", metadata: { browser: "Chrome", profile: "Default", spaceId: UUID } }
-  expect((await chat(plugin, kept)).status).toBe(200)
-  expect((await chat(plugin, kept)).status).toBe(200)
-  expect(reads).toBe(1)
-  const cookies = mock.calls.filter((call) => call.name === "createAgentThread").map((call) => call.init.headers.Cookie)
-  expect(cookies.map((header) => cookieValue(header, "token_v2"))).toEqual(["live", "live"])
-  expect(cookies.every((header) => UUID_PATTERN.test(cookieValue(header, "device_id")))).toBe(true)
-  expired = true
-  expect((await chat(plugin, kept)).status).toBe(401)
-  expect(reads).toBe(1)
-  expired = false
-  expect((await chat(plugin, kept)).status).toBe(200)
-  expect(reads).toBe(2)
-  globalThis.fetch = realFetch
-})
-
-test("a session that was pasted by hand never reads a browser", async () => {
-  const mock = mockNotion()
-  const session = { findSession: async () => { throw new Error("a browser must not be read") } }
-  const plugin = createPlugin(protocol, { session })
-  const auth = { type: "api", key: "token_v2=by-hand", metadata: { spaceId: UUID, activeUserId: USER } }
+  const plugin = createPlugin(protocol, {})
+  const auth = { type: "api", key: "pasted-token-value", metadata: { spaceId: UUID, activeUserId: USER } }
   expect((await chat(plugin, auth)).status).toBe(200)
   const cookies = new Set(mock.calls.map((call) => call.init.headers.Cookie))
   expect(cookies.size).toBe(1)
   const header = cookies.values().next().value
-  expect(header.startsWith(auth.key)).toBe(true)
+  expect(cookieValue(header, "token_v2")).toBe(auth.key)
   expect(UUID_PATTERN.test(cookieValue(header, "device_id"))).toBe(true)
   expect(cookieValue(header, "notion_users")).toBe(encodeURIComponent(JSON.stringify([USER])))
   globalThis.fetch = realFetch
@@ -707,36 +575,6 @@ test.skipIf(!sqlite || process.platform !== "win32")("a v20 store is reported wi
   } finally {
     remove(directory)
   }
-})
-
-test("reusing one browser read does not mix up the accounts that share it", async () => {
-  const mock = mockNotion()
-  const other = "33333333-3333-4333-8333-333333333333"
-  let reads = 0
-  const session = { findSession: async () => { reads++; return { cookie: "token_v2=live", browser: "Chrome", profile: "Default" } } }
-  const plugin = createPlugin(protocol, { session })
-  const first = { type: "api", key: "token_v2=kept", metadata: { browser: "Chrome", profile: "Default", spaceId: UUID } }
-  const second = { type: "api", key: "token_v2=kept", metadata: { browser: "Chrome", profile: "Default", spaceId: other } }
-  expect((await chat(plugin, first)).status).toBe(200)
-  expect((await chat(plugin, second)).status).toBe(200)
-  expect(reads).toBe(1)
-  // One read is shared, but each request still runs in the workspace its own
-  // sign-in names.
-  const created = mock.calls.filter((call) => call.name === "createAgentThread")
-  expect(created.map((call) => call.data.spaceId)).toEqual([UUID, other])
-  expect(created.every((call) => cookieValue(call.init.headers.Cookie, "token_v2") === "live")).toBe(true)
-  expect(created.every((call) => UUID_PATTERN.test(cookieValue(call.init.headers.Cookie, "device_id")))).toBe(true)
-  globalThis.fetch = realFetch
-})
-
-test("a browser read that fails keeps the saved session and the reason it failed", async () => {
-  const session = { findSession: async () => { throw new SessionError("Chrome is running and holds its cookie store open; close Chrome and sign in again", "locked") } }
-  const reader = browserReader(session, 60_000)
-  const kept = { type: "api", key: "token_v2=kept", metadata: { browser: "Chrome", profile: "Default", spaceId: UUID } }
-  const read = await reader.read(kept)
-  expect(read.key).toBe("token_v2=kept")
-  expect(read.metadata.spaceId).toBe(UUID)
-  expect(read.metadata.lastReadError).toContain("close Chrome")
 })
 
 test("a runtime without WebSocket says so instead of blaming the encryption", async () => {

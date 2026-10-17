@@ -6,7 +6,7 @@ const SPACE = "231546b1-eb2d-8176-a5ab-00035eb5210c"
 const OTHER = "e86cfd18-5a19-4b6c-9a71-0c9f9e6d1b42"
 const USER = "22222222-2222-4222-8222-222222222222"
 const THREAD = "33333333-3333-4333-8333-333333333333"
-// A sign-in that states no workspace: exactly what the browser sign-in saves.
+// A sign-in that states no workspace: the workspace is discovered from token_v2.
 const auth = { type: "api", key: "token_v2=offline-session" }
 const model = { model: "test-model", modelMessage: "Test", agentService: {}, modelConfiguration: { supportedReasoningEfforts: ["low"] } }
 const chat = { model: model.model, messages: [{ role: "user", content: "Hello" }] }
@@ -100,7 +100,7 @@ test("the user the session names is sent as the active user", async () => {
 
 test("the create request uses Chrome web headers and a normalized Cookie", async () => {
   const mock = mockNotion()
-  const stated = { type: "api", key: "token_v2=probe-token; notion_user_id=" + USER, metadata: { activeUserId: USER } }
+  const stated = { type: "api", key: "token_v2={{SECRET_k3t7vnyw}}; notion_user_id=" + USER, metadata: { activeUserId: USER } }
   for await (const event of await protocol.open({ auth: stated, chat, signal: AbortSignal.timeout(5_000) })) void event
   const created = mock.calls.find((call) => call.name === "createAgentThread")
   const listen = mock.calls.find((call) => call.name === "listenToThreadTranscript")
@@ -110,7 +110,7 @@ test("the create request uses Chrome web headers and a normalized Cookie", async
   expect(listen.headers.Accept).toBe("application/x-ndjson")
   expect(created.headers["notion-audit-log-platform"]).toBe("web")
   expect(created.headers["Sec-Fetch-Site"]).toBe("same-origin")
-  expect(cookieValue(created.headers.Cookie, "token_v2")).toBe(cookieValue(stated.key, "token_v2"))
+  expect(cookieValue(created.headers.Cookie, "token_v2")).toBe("{{SECRET_k3t7vnyw}}")
   expect(cookieValue(created.headers.Cookie, "device_id")).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
   expect(cookieValue(created.headers.Cookie, "notion_users")).toBe(encodeURIComponent(JSON.stringify([USER])))
   expect(new Set(mock.calls.map((call) => cookieValue(call.headers.Cookie, "device_id"))).size).toBe(1)
