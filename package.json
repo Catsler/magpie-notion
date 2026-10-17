@@ -26,6 +26,7 @@
     "README.md",
     "README.zh-CN.md",
     "check.mjs",
+    "direct.mjs",
     "core.mjs",
     "index.mjs",
     "protocol.mjs",

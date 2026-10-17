@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto"
 import { ProviderError } from "./core.mjs"
+import { exchange } from "./direct.mjs"
 import { readNDJSON, transcriptEvents, sessionError } from "./transcript.mjs"
 
 const ORIGIN = "https://app.notion.com"
@@ -39,21 +40,69 @@ function credentials(auth) {
   return { cookie: key, spaceId, activeUserId }
 }
 
-async function call(name, data, account, signal) {
-  const headers = { "Content-Type": "application/json", Cookie: account.cookie, Origin: ORIGIN }
+// WEB_AGENT is the client the edge expects to be talking to. With fetch it is
+// what the runtime announces, and the runtime's own name (Bun/1.4, curl/8, or
+// nothing at all for node:https) is refused at createAgentThread with
+// "UserValidationError" however correct the cookies and the body are. Every
+// other part of the request is the same either way.
+const WEB_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
+
+function requestHeaders(account) {
+  const headers = { "Content-Type": "application/json", Cookie: account.cookie, Origin: ORIGIN, "User-Agent": WEB_AGENT }
   if (account.spaceId) headers["x-notion-space-id"] = account.spaceId
   if (account.activeUserId) headers["x-notion-active-user-header"] = account.activeUserId
+  return headers
+}
+
+function refused(status) {
+  const code = status === 401 ? "session_expired" : status === 403 ? "workspace_forbidden" : status === 429 ? "rate_limited" : "upstream_http_error"
+  return new ProviderError(status, code, `Notion AI refused the request (HTTP ${status}).`)
+}
+
+async function call(name, data, account, signal) {
   const response = await fetch(`${ORIGIN}/api/v3/${name}`, {
     method: "POST",
-    headers,
+    headers: requestHeaders(account),
     body: JSON.stringify(data), signal, redirect: "error",
   })
   if (!response.ok) {
     await response.body?.cancel().catch(() => {})
-    const code = response.status === 401 ? "session_expired" : response.status === 403 ? "workspace_forbidden" : response.status === 429 ? "rate_limited" : "upstream_http_error"
-    throw new ProviderError(response.status, code, `Notion AI refused the request (HTTP ${response.status}).`)
+    throw refused(response.status)
   }
   return response
+}
+
+// post is the transport every JSON request goes through: the socket that writes
+// Host first. The unit suites put a fetch-backed one here so their mocked
+// answers stay the answers, which is what viaFetch does.
+let post = exchange
+
+function viaFetch(url, headers, body, options = {}) {
+  return (async () => {
+    const response = await fetch(url, { method: "POST", headers, body, signal: options.signal, redirect: "error" })
+    return { status: response.status, text: await response.text(), headers: response.headers }
+  })()
+}
+
+// raw posts a JSON request the way the edge reads it: over our own socket, with
+// Host first. It falls back to fetch only when no socket can be opened at all
+// (a host that routes through an explicit proxy), which is the case this
+// transport cannot serve; every other endpoint already answers fetch.
+async function raw(name, data, account, signal) {
+  const body = JSON.stringify(data)
+  try {
+    const answer = await post(`${ORIGIN}/api/v3/${name}`, requestHeaders(account), body, { signal })
+    if (answer.status < 200 || answer.status >= 300) throw refused(answer.status)
+    return answer.text
+  } catch (error) {
+    if (error instanceof ProviderError || error?.name === "AbortError") throw error
+    return (await call(name, data, account, signal)).text()
+  }
+}
+
+async function json(name, data, account, signal) {
+  const text = await raw(name, data, account, signal)
+  try { return JSON.parse(text) } catch { throw new ProviderError(502, "invalid_upstream_json", "Notion AI returned invalid JSON.") }
 }
 
 const resolved = new Map()
@@ -104,11 +153,6 @@ async function accountOf(auth, signal) {
   if (read.spaceId) return read
   const found = await workspace(read, signal)
   return { cookie: read.cookie, spaceId: found.spaceId, activeUserId: read.activeUserId ?? found.activeUserId }
-}
-
-async function json(name, data, account, signal) {
-  const response = await call(name, data, account, signal)
-  try { return await response.json() } catch { throw new ProviderError(502, "invalid_upstream_json", "Notion AI returned invalid JSON.") }
 }
 
 function eligible(entry) {
@@ -336,4 +380,9 @@ export default {
   usage: quota,
 }
 
-export const _internal = { cookie, credentials, accountOf, workspace, resolved, RESOLVED_TTL, keepModels, initialText, content, sessions, catalogs, eligible, modelEntry, percent, rollingWindow, billingWindow, quotaWindows }
+export const _internal = { cookie, credentials, accountOf, workspace, resolved, RESOLVED_TTL, keepModels, initialText, content, sessions, catalogs, eligible, modelEntry, percent, rollingWindow, billingWindow, quotaWindows, requestHeaders, WEB_AGENT, viaFetch, useTransport, useSocket }
+
+// The unit suites answer from their own fetch, so they swap the socket for one
+// that reads it. Nothing else calls these: a host runs the socket.
+function useTransport(next) { post = next }
+function useSocket() { post = exchange }
