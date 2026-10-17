@@ -8,7 +8,7 @@ This speaks Notion's internal web client API, not the public integration API.
 It is unofficial and can break when Notion changes its client. Development
 follows [issue #118](https://github.com/magpie-community/plugins/issues/118).
 
-Status: development build, version 0.2.0. Its core protocol was captured from a
+Status: development build, version 0.2.2. Its core protocol was captured from a
 consenting account on 2026-10-16: model listing, new-thread creation, a
 streamed answer and a second turn worked in Notion's browser client. A
 browser-compatible bundle of these exact provider modules then listed 29
@@ -30,6 +30,9 @@ magpie plugin login notion
 
 Publishing to npm is planned under the name `opencode-notion-auth`; from then
 on `magpie plugin add opencode-notion-auth` works too.
+
+Magpie installs the plugin's runtime dependencies when it adds the plugin. No
+install script is used, and chat does not need a browser inside the container.
 
 ## What it gives
 
@@ -63,20 +66,27 @@ Two methods are offered, and neither asks for a workspace UUID:
   session, an optional workspace UUID and an optional active-user UUID when the
   browser holds several Notion identities.
 
-A container or server with no desktop browser can point this build at a
-Chromium **user data directory** prepared ahead of time (or kept after one
-sign-in): set `NOTION_BROWSER_PROFILE` or `MAGPIE_NOTION_BROWSER_PROFILE` to
-one or more such directories, separated the way the platform separates paths
-(`;` on Windows, `:` on macOS and Linux). A named directory is the user data
-directory itself, the one `--user-data-dir` names: `Local State` and, while a
-browser is running, `DevToolsActivePort` are at its root, and the profiles
-(`Default`, `Profile 1`, ...) sit below it, each keeping its cookies in
-`Network/Cookies` (or `Cookies`). Those directories are read before the
-system's own Chrome, Edge, Brave and Chromium locations; a directory named in
-both variables is read once. A directory holding only a `DevToolsActivePort` is
-asked over that debugging port instead. Mount that one user data directory
-rather than a whole user or home directory, and never expose a debugging port
-beyond the machine itself.
+Sign-in still reads the local browser or accepts a pasted Cookie. Once signed
+in, chat does not keep the user's browser open and does not need a browser
+inside Docker. Only thread creation uses the installed impit Chrome client.
+Catalog, quota and transcript streaming stay on ordinary HTTP and do not need
+the user's browser or a browser inside Docker.
+
+If sign-in should read a browser profile instead of a pasted Cookie, a
+container or server with no desktop browser can point this build at a Chromium
+**user data directory** prepared ahead of time (or kept after one sign-in): set
+`NOTION_BROWSER_PROFILE` or `MAGPIE_NOTION_BROWSER_PROFILE` to one or more such
+directories, separated the way the platform separates paths (`;` on Windows,
+`:` on macOS and Linux). A named directory is the user data directory itself,
+the one `--user-data-dir` names: `Local State` and, while a browser is running,
+`DevToolsActivePort` are at its root, and the profiles (`Default`,
+`Profile 1`, ...) sit below it, each keeping its cookies in `Network/Cookies`
+(or `Cookies`). Those directories are read before the system's own Chrome,
+Edge, Brave and Chromium locations; a directory named in both variables is
+read once. A directory holding only a `DevToolsActivePort` is asked over that
+debugging port instead. Mount that one user data directory rather than a whole
+user or home directory, and never expose a debugging port beyond the machine
+itself.
 
 The workspace (`spaceId`) does not have to be typed. The session is asked for
 its spaces and each candidate is probed with `getAvailableModels` until one

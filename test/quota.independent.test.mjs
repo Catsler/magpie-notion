@@ -166,7 +166,8 @@ test("quota: requests use the selected account and workspace without logging the
   expect(call.url).toBe("https://app.notion.com/api/v3/getCreditRateLimitStatus")
   expect(call.method).toBe("POST")
   expect(JSON.parse(call.body).spaceId).toBe(auth.metadata.spaceId)
-  expect(call.headers.Cookie).toBe(auth.key)
+  expect(call.headers.Cookie.startsWith(auth.key)).toBe(true)
+  expect(call.headers.Cookie).toContain("notion_users=" + encodeURIComponent(JSON.stringify([auth.metadata.activeUserId])))
   expect(call.headers["x-notion-space-id"]).toBe(auth.metadata.spaceId)
   expect(call.headers["x-notion-active-user-header"]).toBe(auth.metadata.activeUserId)
   expect(call.redirect).toBe("error")
@@ -188,7 +189,9 @@ test("quota: consecutive accounts do not share usage or identity state", async (
   const second = await usage(singleWindow({ used: 73, limit: 100 }), { auth: otherAuth })
   expect(first.result.windows[0].used).toBe(12)
   expect(second.result.windows[0].used).toBe(73)
-  expect(second.calls.find((c) => c.name === "getCreditRateLimitStatus").headers.Cookie).toBe(otherAuth.key)
+  const otherCookie = second.calls.find((c) => c.name === "getCreditRateLimitStatus").headers.Cookie
+  expect(otherCookie.startsWith(otherAuth.key)).toBe(true)
+  expect(otherCookie).toContain("notion_users=" + encodeURIComponent(JSON.stringify([otherAuth.metadata.activeUserId])))
 })
 
 test.each([403, 429, 503])("quota: HTTP %i does not mislabel sign-in expiry", async (status) => {
@@ -231,7 +234,8 @@ test("quota V2: actual 300-credit balance is independent from standard allowance
   expect(result.windows.map((w) => w.used).sort((a, b) => a - b)).toEqual([0.01, 0.03])
   const call = calls.find((c) => c.name === "getAIUsageEligibilityV2")
   expect(JSON.parse(call.body).spaceId).toBe(auth.metadata.spaceId)
-  expect(call.headers.Cookie).toBe(auth.key)
+  expect(call.headers.Cookie.startsWith(auth.key)).toBe(true)
+  expect(call.headers.Cookie).toContain("notion_users=" + encodeURIComponent(JSON.stringify([auth.metadata.activeUserId])))
 })
 
 test("quota V2: a true zero balance wins over positive perSource limits", async () => {

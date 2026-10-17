@@ -270,7 +270,8 @@ test("incoming credentials are not forwarded, and safe agent settings are presen
   expect(mock.calls.every((v) => v.url.startsWith("https://app.notion.com/api/v3/"))).toBe(true)
   for (const call of mock.calls) {
     expect(call.init.headers.Authorization).toBeUndefined()
-    expect(call.init.headers.Cookie).toBe(auth.key)
+    expect(call.init.headers.Cookie.startsWith(auth.key)).toBe(true)
+    expect(call.init.headers.Cookie).toContain("notion_users=" + encodeURIComponent(JSON.stringify([user])))
     expect(call.init.headers["x-notion-active-user-header"]).toBe(user)
     expect(call.init.redirect).toBe("error")
   }

@@ -17,6 +17,8 @@ magpie plugin add https://github.com/resucdueff/magpie-notion
 magpie plugin login notion
 ```
 
+Magpie 添加插件时会安装它的运行依赖，不依赖安装脚本；聊天在 Docker 里也不需要浏览器。
+
 登录有两种方式，都不需要你填工作区 UUID：
 
 - **直接用本机浏览器里已登录的 Notion 会话**（默认方式）。插件会按
@@ -33,17 +35,22 @@ magpie plugin login notion
 - **手动粘贴 Cookie 请求头**：给本插件读不了的浏览器用。填你本人 Notion
   网页会话的完整 Cookie 请求头，`spaceId`、activeUserId 都可留空。
 
-没有桌面浏览器的容器或服务器，可以把事先准备好（或登录一次后保留下来）的
-Chromium **user data 目录**指给插件：设 `NOTION_BROWSER_PROFILE` 或
-`MAGPIE_NOTION_BROWSER_PROFILE`，各接受一个或多个这样的目录，多个用当前平台的
-路径分隔符分隔（Windows 分号，macOS 与 Linux 冒号）。这里指的是 user data
-目录本身，也就是 `--user-data-dir` 指向的那个目录：`Local State` 和（浏览器
-运行时才有的）`DevToolsActivePort` 都在它的根上，具体的 profile（`Default`、
-`Profile 1`……）在它下面，各自的 cookie 库位于 `Network/Cookies`（或
-`Cookies`）。这些目录会排在系统默认的 Chrome、Edge、Brave、Chromium 位置之前
-优先读取，两个变量里重复出现的同一目录只读一次。目录里只有 `DevToolsActivePort`
-时，则改走该调试端口读取。注意：只挂载这个 user data 目录本身，不要挂载整个
-用户目录；调试端口不要暴露到公网。
+登录仍会读取本机浏览器，或接受粘贴的 Cookie；读取只用于拿到会话。登录后，
+聊天不要求用户的浏览器继续开着，Docker 里也不需要浏览器。只有创建线程使用
+已安装的 impit Chrome 客户端；模型目录、额度和转录流仍走普通 HTTP，不需要
+用户的浏览器，也不需要在 Docker 里运行浏览器。
+
+如果登录要从浏览器配置里读取而不是粘贴 Cookie，没有桌面浏览器的容器或服务器
+可以把事先准备好（或登录一次后保留下来）的 Chromium **user data 目录**指给
+插件：设 `NOTION_BROWSER_PROFILE` 或 `MAGPIE_NOTION_BROWSER_PROFILE`，各接受
+一个或多个这样的目录，多个用当前平台的路径分隔符分隔（Windows 分号，macOS 与
+Linux 冒号）。这里指的是 user data 目录本身，也就是 `--user-data-dir` 指向的
+那个目录：`Local State` 和（浏览器运行时才有的）`DevToolsActivePort` 都在它的
+根上，具体的 profile（`Default`、`Profile 1`……）在它下面，各自的 cookie 库
+位于 `Network/Cookies`（或 `Cookies`）。这些目录会排在系统默认的 Chrome、Edge、
+Brave、Chromium 位置之前优先读取，两个变量里重复出现的同一目录只读一次。目录里
+只有 `DevToolsActivePort` 时，则改走该调试端口读取。注意：只挂载这个 user data
+目录本身，不要挂载整个用户目录；调试端口不要暴露到公网。
 
 工作区（`spaceId`）是自动发现的：先问会话有哪些 space，再逐个用
 `getAvailableModels` 探测，第一个能答的就是当前工作区，那份模型表也就直接

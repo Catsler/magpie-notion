@@ -1,6 +1,6 @@
 {
   "name": "opencode-notion-auth",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Notion AI (Business) as a magpie / OpenCode provider: sign in with your own Notion web session, use the workspace's live Notion AI model catalog, and see the plan's credit windows.",
   "type": "module",
   "main": "./index.mjs",
@@ -14,7 +14,9 @@
   "engines": {
     "node": ">=20"
   },
-  "dependencies": {},
+  "dependencies": {
+    "impit": "0.14.6"
+  },
   "keywords": [
     "opencode",
     "opencode-plugin",

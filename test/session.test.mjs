@@ -10,7 +10,9 @@ import { SessionError, bestCookies, browserStores, cookieHeader, copyToTemporary
 
 const UUID = "11111111-1111-4111-8111-111111111111"
 const USER = "22222222-2222-4222-8222-222222222222"
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const realFetch = globalThis.fetch
+const cookieValue = (header, name) => header.split(";").map((part) => part.trim()).find((part) => part.startsWith(name + "="))?.slice(name.length + 1)
 
 let sqlite
 try { sqlite = (await import("bun:sqlite")).Database } catch { sqlite = undefined }
@@ -497,7 +499,9 @@ test("a request reads the browser again, and the saved session is the fallback",
   expect((await chat(plugin, kept)).status).toBe(200)
   expect((await chat(plugin, kept)).status).toBe(200)
   expect(reads).toBe(2)
-  expect(mock.calls.filter((call) => call.name === "createAgentThread").map((call) => call.init.headers.Cookie)).toEqual(["token_v2=live-one", "token_v2=kept"])
+  const cookies = mock.calls.filter((call) => call.name === "createAgentThread").map((call) => call.init.headers.Cookie)
+  expect(cookies.map((header) => cookieValue(header, "token_v2"))).toEqual(["live-one", "kept"])
+  expect(cookies.every((header) => UUID_PATTERN.test(cookieValue(header, "device_id")))).toBe(true)
   globalThis.fetch = realFetch
 })
 
@@ -511,7 +515,9 @@ test("a burst of requests reuses one browser read, and an unauthorized answer dr
   expect((await chat(plugin, kept)).status).toBe(200)
   expect((await chat(plugin, kept)).status).toBe(200)
   expect(reads).toBe(1)
-  expect(mock.calls.filter((call) => call.name === "createAgentThread").map((call) => call.init.headers.Cookie)).toEqual(["token_v2=live", "token_v2=live"])
+  const cookies = mock.calls.filter((call) => call.name === "createAgentThread").map((call) => call.init.headers.Cookie)
+  expect(cookies.map((header) => cookieValue(header, "token_v2"))).toEqual(["live", "live"])
+  expect(cookies.every((header) => UUID_PATTERN.test(cookieValue(header, "device_id")))).toBe(true)
   expired = true
   expect((await chat(plugin, kept)).status).toBe(401)
   expect(reads).toBe(1)
@@ -527,7 +533,12 @@ test("a session that was pasted by hand never reads a browser", async () => {
   const plugin = createPlugin(protocol, { session })
   const auth = { type: "api", key: "token_v2=by-hand", metadata: { spaceId: UUID, activeUserId: USER } }
   expect((await chat(plugin, auth)).status).toBe(200)
-  expect(new Set(mock.calls.map((call) => call.init.headers.Cookie))).toEqual(new Set(["token_v2=by-hand"]))
+  const cookies = new Set(mock.calls.map((call) => call.init.headers.Cookie))
+  expect(cookies.size).toBe(1)
+  const header = cookies.values().next().value
+  expect(header.startsWith(auth.key)).toBe(true)
+  expect(UUID_PATTERN.test(cookieValue(header, "device_id"))).toBe(true)
+  expect(cookieValue(header, "notion_users")).toBe(encodeURIComponent(JSON.stringify([USER])))
   globalThis.fetch = realFetch
 })
 
@@ -578,7 +589,8 @@ test("reusing one browser read does not mix up the accounts that share it", asyn
   // sign-in names.
   const created = mock.calls.filter((call) => call.name === "createAgentThread")
   expect(created.map((call) => call.data.spaceId)).toEqual([UUID, other])
-  expect(created.every((call) => call.init.headers.Cookie === "token_v2=live")).toBe(true)
+  expect(created.every((call) => cookieValue(call.init.headers.Cookie, "token_v2") === "live")).toBe(true)
+  expect(created.every((call) => UUID_PATTERN.test(cookieValue(call.init.headers.Cookie, "device_id")))).toBe(true)
   globalThis.fetch = realFetch
 })
 
