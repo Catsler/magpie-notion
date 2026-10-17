@@ -6,6 +6,9 @@
 Notion 网页客户端所调用的内部接口，不是 Notion 的公开 Integration API；Notion
 更新网页端后，插件可能失效。
 
+插件图标使用 Notion 官方黑白 N 方块标志，源文件保存在 otion.svg\，
+并内嵌到包元数据里。名称与标志属于 Notion；本项目是非官方插件。
+
 ## 安装
 
 ```sh
