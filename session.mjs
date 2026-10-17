@@ -469,7 +469,9 @@ export function copyToTemporary(store, options = {}) {
     discard(directory)
     const code = error?.code
     if (platform === "darwin" && (code === "EPERM" || code === "EACCES")) {
-      throw new SessionError(`macOS does not let this app read ${store.browser}'s data; give magpie Full Disk Access in System Settings › Privacy & Security › Full Disk Access and sign in again, or sign in with the Notion web session (paste the Cookie header)`, "permission")
+      // The way out is named once, by the sign-in that reports this, so this
+      // message stays the permission it is asking for and nothing else.
+      throw new SessionError(`macOS does not let this app read ${store.browser}'s data; give magpie Full Disk Access in System Settings › Privacy & Security › Full Disk Access and sign in again`, "permission")
     }
     if (code === "EBUSY" || code === "EPERM" || code === "EACCES") {
       throw new SessionError(`${store.browser} is running and holds its cookie store open; close ${store.browser} and sign in again`, "locked")
