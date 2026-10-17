@@ -15,6 +15,13 @@ const realFetch = globalThis.fetch
 let sqlite
 try { sqlite = (await import("bun:sqlite")).Database } catch { sqlite = undefined }
 
+// The real-runtime test below needs a Node that ships node:sqlite without a
+// flag. It is probed once here so the test can be skipped, not failed, on a
+// machine whose node is older than that.
+const nodeRuntime = await new Promise((resolve) => {
+  execFile("node", ["--input-type=module", "-e", "import('node:sqlite').then(() => process.stdout.write(process.versions.node))"], { windowsHide: true, timeout: 15_000 }, (error, stdout) => resolve(error ? undefined : String(stdout).trim()))
+})
+
 const gcmSeal = (value, key, prefix = "v10") => {
   const nonce = randomBytes(12)
   const cipher = createCipheriv("aes-256-gcm", key, nonce)
@@ -689,4 +696,258 @@ test("a node:sqlite store is read through prepare(), the way DatabaseSync answer
   const node = { prepare: (sql) => { asked.push(sql); return { all: () => rows } } }
   expect(_internal.all(node, "SELECT 2")).toBe(rows)
   expect(asked).toEqual(["SELECT 2"])
+})
+
+test("a user data directory named in the environment is read the way --user-data-dir is", () => {
+  const home = mkdtempSync(join(tmpdir(), "magpie-custom-"))
+  try {
+    const root = join(home, "custom-user-data")
+    // Local State lives at the user data directory's root and names the
+    // profiles below it, exactly as Chromium writes it under --user-data-dir.
+    mkdirSync(join(root, "Profile 2", "Network"), { recursive: true })
+    mkdirSync(join(root, "Default"), { recursive: true })
+    writeFileSync(join(root, "Local State"), JSON.stringify({ profile: { info_cache: { Default: {}, "Profile 2": {} }, last_used: "Profile 2" } }))
+    writeFileSync(join(root, "Profile 2", "Network", "Cookies"), "not a database")
+    writeFileSync(join(root, "Default", "Cookies"), "not a database")
+    const stores = browserStores({ platform: "win32", home, env: { LOCALAPPDATA: join(home, "none"), NOTION_BROWSER_PROFILE: root } })
+    expect(stores.length).toBe(2)
+    // The profile named last used comes first, and both store layouts are found.
+    expect(stores[0]).toMatchObject({ kind: "chromium", browser: "Chromium", root, profile: "Profile 2", db: join(root, "Profile 2", "Network", "Cookies") })
+    expect(stores[1]).toMatchObject({ profile: "Default", db: join(root, "Default", "Cookies") })
+  } finally {
+    remove(home)
+  }
+})
+
+test("findSession reads a user data directory that has only written DevToolsActivePort", async () => {
+  const home = mkdtempSync(join(tmpdir(), "magpie-devtools-only-"))
+  const real = globalThis.WebSocket
+  const endpoints = []
+  const cookies = [
+    { name: "token_v2", value: "live-session", domain: ".app.notion.com" },
+    { name: "notion_user_id", value: USER, domain: ".app.notion.com" },
+    { name: "tracking", value: "no", domain: ".notion.so" },
+  ]
+  class FakeWebSocket {
+    constructor(endpoint) {
+      this.listeners = {}
+      endpoints.push(endpoint)
+      Promise.resolve().then(() => {
+        this.emit("open")
+        this.emit("message", { data: JSON.stringify({ id: 1, result: { cookies } }) })
+      })
+    }
+    addEventListener(type, handler) { (this.listeners[type] ??= []).push(handler) }
+    emit(type, event = {}) { for (const handler of this.listeners[type] ?? []) handler(event) }
+    send() {}
+    close() {}
+  }
+  globalThis.WebSocket = FakeWebSocket
+  try {
+    const root = join(home, "user-data")
+    mkdirSync(root)
+    // Only the port: there is no Cookies file anywhere in this directory.
+    writeFileSync(join(root, "DevToolsActivePort"), "9222\n/devtools/browser/devtools-path\n")
+    const found = await findSession({ platform: "win32", home, env: { LOCALAPPDATA: join(home, "none"), NOTION_BROWSER_PROFILE: root } })
+    expect(endpoints).toEqual(["ws://127.0.0.1:9222/devtools/browser/devtools-path"])
+    expect(found).toEqual({ cookie: `token_v2=live-session; notion_user_id=${USER}`, browser: "Chromium", profile: "Default", via: "devtools", activeUserId: USER })
+  } finally {
+    globalThis.WebSocket = real
+    remove(home)
+  }
+})
+
+test.skipIf(!sqlite || !nodeRuntime)(`a real Node ${nodeRuntime ?? "runtime"} reads a synthetic store through node:sqlite's prepare()`, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "magpie-node-sqlite-"))
+  try {
+    const key = randomBytes(32)
+    const db = join(directory, "Cookies")
+    // A real SQLite file, written by this runtime and read by the other one.
+    writeFixture(db, [["token_v2", "node-session", ".notion.so"], ["notion_user_id", USER, "www.notion.so"]], key)
+    try { Bun.gc(true) } catch { /* not bun */ }
+    const localState = join(directory, "Local State")
+    // The key is handed to the child through the same injectable `run` the
+    // in-process fixtures use, so this test needs no DPAPI call of its own.
+    writeFileSync(localState, JSON.stringify({ os_crypt: { encrypted_key: Buffer.concat([Buffer.from("DPAPI"), randomBytes(32)]).toString("base64") } }))
+    const store = { kind: "chromium", browser: "Chrome", profile: "Default", root: directory, db, localState }
+    const script = join(directory, "read.mjs")
+    const sessionUrl = new URL("../session.mjs", import.meta.url).href
+    writeFileSync(script, [
+      `const { openDatabase, _internal } = await import(${JSON.stringify(sessionUrl)})`,
+      `const store = ${JSON.stringify(store)}`,
+      `const opened = await openDatabase(store.db)`,
+      `const shape = { query: typeof opened.query, prepare: typeof opened.prepare }`,
+      `opened.close()`,
+      `const rows = await _internal.readStore(store, { platform: "win32", run: async () => ${JSON.stringify(key.toString("base64"))} })`,
+      `process.stdout.write(JSON.stringify({ version: process.versions.node, shape, rows }))`,
+    ].join("\n"))
+    const output = await new Promise((resolve, reject) => {
+      execFile("node", [script], { windowsHide: true, timeout: 15_000, maxBuffer: 1_000_000 }, (error, stdout, stderr) => {
+        if (!error) return resolve(stdout)
+        // The experimental-feature notice is not a failure; anything else is,
+        // and its text never holds a cookie value.
+        const detail = String(stderr ?? "").split(/\r?\n/).filter((line) => line.trim() && !line.includes("ExperimentalWarning") && !line.includes("SQLite is an experimental feature")).join(" | ")
+        reject(new Error(`the Node runtime could not read the synthetic store${detail ? `: ${detail}` : ""}`))
+      })
+    })
+    const read = JSON.parse(output)
+    // Under Node the Bun driver is absent, so the store must have been opened
+    // by node:sqlite - prepare() and no query() - and read through it.
+    expect(read.shape).toEqual({ query: "undefined", prepare: "function" })
+    expect(read.rows).toEqual([
+      { name: "token_v2", value: "node-session", host: ".notion.so" },
+      { name: "notion_user_id", value: USER, host: "www.notion.so" },
+    ])
+  } finally {
+    remove(directory)
+  }
+}, 20_000)
+
+test("a user data directory named in the environment outranks a default browser's store", async () => {
+  const home = mkdtempSync(join(tmpdir(), "magpie-override-"))
+  try {
+    // The explicit override has only a debugging port: no store to open.
+    const explicit = join(home, "explicit-user-data")
+    mkdirSync(explicit)
+    writeFileSync(join(explicit, "DevToolsActivePort"), "9222\n/devtools/browser/explicit-path\n")
+    // The desktop's own Chrome has a readable store with a different session;
+    // before the override was enforced, that store answered first.
+    const local = join(home, "AppData", "Local")
+    const defaultRoot = join(local, "Google", "Chrome", "User Data")
+    mkdirSync(join(defaultRoot, "Default", "Network"), { recursive: true })
+    writeFileSync(join(defaultRoot, "Default", "Network", "Cookies"), "not a database")
+    const key = randomBytes(32)
+    writeFileSync(join(defaultRoot, "Local State"), JSON.stringify({ os_crypt: { encrypted_key: Buffer.concat([Buffer.from("DPAPI"), randomBytes(32)]).toString("base64") } }))
+    const diskRows = [{ name: "token_v2", encrypted_value: gcmSeal("disk-session", key), host: ".notion.so" }]
+    const copies = []
+    const asked = []
+    const found = await findSession({
+      platform: "win32",
+      home,
+      env: { LOCALAPPDATA: local, NOTION_BROWSER_PROFILE: explicit },
+      copyStore: (store) => { copies.push(store.root); return { path: store.db, remove: () => {} } },
+      openDatabase: () => database(diskRows),
+      run: async () => key.toString("base64"),
+      connect: async (endpoint) => {
+        asked.push(endpoint)
+        return [
+          { name: "token_v2", value: "live-session", domain: ".app.notion.com" },
+          { name: "notion_user_id", value: USER, domain: ".app.notion.com" },
+        ]
+      },
+    })
+    // The default store is never opened, and the explicit root's port is
+    // asked exactly once before any fallback.
+    expect(copies).toEqual([])
+    expect(asked).toEqual(["ws://127.0.0.1:9222/devtools/browser/explicit-path"])
+    expect(found).toEqual({ cookie: `token_v2=live-session; notion_user_id=${USER}`, browser: "Chromium", profile: "Default", via: "devtools", activeUserId: USER })
+  } finally {
+    remove(home)
+  }
+})
+
+test("the default browsers still read their store before their debugging port", async () => {
+  const home = mkdtempSync(join(tmpdir(), "magpie-default-order-"))
+  try {
+    const local = join(home, "AppData", "Local")
+    const root = join(local, "Google", "Chrome", "User Data")
+    mkdirSync(join(root, "Default", "Network"), { recursive: true })
+    writeFileSync(join(root, "Default", "Network", "Cookies"), "not a database")
+    writeFileSync(join(root, "DevToolsActivePort"), "9222\n/devtools/browser/default-path\n")
+    const key = randomBytes(32)
+    writeFileSync(join(root, "Local State"), JSON.stringify({ os_crypt: { encrypted_key: Buffer.concat([Buffer.from("DPAPI"), randomBytes(32)]).toString("base64") } }))
+    const rows = [{ name: "token_v2", encrypted_value: gcmSeal("disk-session", key), host: ".notion.so" }]
+    let asked = 0
+    const found = await findSession({
+      platform: "win32",
+      home,
+      env: { LOCALAPPDATA: local },
+      copyStore: (store) => ({ path: store.db, remove: () => {} }),
+      openDatabase: () => database(rows),
+      run: async () => key.toString("base64"),
+      connect: async () => { asked++; return [{ name: "token_v2", value: "live-session", domain: ".app.notion.com" }] },
+    })
+    // No override is named, so the disk store answers and the port is not
+    // consulted at all.
+    expect(asked).toBe(0)
+    expect(found).toEqual({ cookie: "token_v2=disk-session", browser: "Chrome", profile: "Default" })
+  } finally {
+    remove(home)
+  }
+})
+
+test("a named directory still outranks the default browser when it is written with a trailing separator or as a relative path", async () => {
+  const home = mkdtempSync(join(tmpdir(), "magpie-same-root-"))
+  const previous = process.cwd()
+  try {
+    const explicit = join(home, "explicit-user-data")
+    mkdirSync(explicit)
+    writeFileSync(join(explicit, "DevToolsActivePort"), "9222\n/devtools/browser/explicit-path\n")
+    const local = join(home, "AppData", "Local")
+    const defaultRoot = join(local, "Google", "Chrome", "User Data")
+    mkdirSync(join(defaultRoot, "Default", "Network"), { recursive: true })
+    writeFileSync(join(defaultRoot, "Default", "Network", "Cookies"), "not a database")
+    const key = randomBytes(32)
+    writeFileSync(join(defaultRoot, "Local State"), JSON.stringify({ os_crypt: { encrypted_key: Buffer.concat([Buffer.from("DPAPI"), randomBytes(32)]).toString("base64") } }))
+    const diskRows = [{ name: "token_v2", encrypted_value: gcmSeal("disk-session", key), host: ".notion.so" }]
+    // The same directory, written the two ways an operator actually writes it:
+    // a trailing separator, and a path that is only absolute once resolved.
+    process.chdir(home)
+    for (const spelled of [`${explicit}${delimiter === ";" ? "\\" : "/"}`, "explicit-user-data"]) {
+      const copies = []
+      const asked = []
+      const found = await findSession({
+        platform: "win32",
+        home,
+        env: { LOCALAPPDATA: local, NOTION_BROWSER_PROFILE: spelled },
+        copyStore: (store) => { copies.push(store.root); return { path: store.db, remove: () => {} } },
+        openDatabase: () => database(diskRows),
+        run: async () => key.toString("base64"),
+        connect: async (endpoint) => {
+          asked.push(endpoint)
+          return [{ name: "token_v2", value: "live-session", domain: ".app.notion.com" }]
+        },
+      })
+      // Spelling the directory differently must not drop it into the default
+      // group: the default store stays closed and the named port is the one asked.
+      expect(copies).toEqual([])
+      expect(asked).toEqual(["ws://127.0.0.1:9222/devtools/browser/explicit-path"])
+      expect(found.cookie).toBe("token_v2=live-session")
+    }
+  } finally {
+    process.chdir(previous)
+    remove(home)
+  }
+})
+
+test("a named debugging port that cannot be read does not hide a session the default browser already has", async () => {
+  const home = mkdtempSync(join(tmpdir(), "magpie-port-fallback-"))
+  try {
+    const explicit = join(home, "explicit-user-data")
+    mkdirSync(explicit)
+    writeFileSync(join(explicit, "DevToolsActivePort"), "9222\n/devtools/browser/explicit-path\n")
+    const local = join(home, "AppData", "Local")
+    const defaultRoot = join(local, "Google", "Chrome", "User Data")
+    mkdirSync(join(defaultRoot, "Default", "Network"), { recursive: true })
+    writeFileSync(join(defaultRoot, "Default", "Network", "Cookies"), "not a database")
+    const key = randomBytes(32)
+    writeFileSync(join(defaultRoot, "Local State"), JSON.stringify({ os_crypt: { encrypted_key: Buffer.concat([Buffer.from("DPAPI"), randomBytes(32)]).toString("base64") } }))
+    const diskRows = [{ name: "token_v2", encrypted_value: gcmSeal("disk-session", key), host: ".notion.so" }]
+    const copies = []
+    const found = await findSession({
+      platform: "win32",
+      home,
+      env: { LOCALAPPDATA: local, NOTION_BROWSER_PROFILE: explicit },
+      copyStore: (store) => { copies.push(store.root); return { path: store.db, remove: () => {} } },
+      openDatabase: () => database(diskRows),
+      run: async () => key.toString("base64"),
+      connect: async () => { throw new Error("the debugging port refused") },
+    })
+    // The named port failed, so the default browser's own store is read next
+    // instead of failing the whole sign-in.
+    expect(copies).toEqual([defaultRoot])
+    expect(found).toEqual({ cookie: "token_v2=disk-session", browser: "Chrome", profile: "Default" })
+  } finally {
+    remove(home)
+  }
 })

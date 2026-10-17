@@ -48,31 +48,33 @@ Two methods are offered, and neither asks for a workspace UUID:
   session out of the browser this machine is already signed in to: Chrome, Edge,
   Brave, Chromium or Firefox, on Windows, macOS and Linux, in that order. The
   store is copied before it is opened, so a running browser is not disturbed.
-  Windows values are opened with the DPAPI-protected key in the profile's
-  `Local State`, macOS with its Keychain entry, Linux with `secret-tool`. A
-  `v20` (app-bound) value is reported rather than guessed at. When the store
-  cannot be read - a browser holds it open, or the values are app-bound - a
-  running Chromium is asked over the debugging port its profile writes to
-  `DevToolsActivePort`: one local WebSocket read that never writes anything.
-  That fallback needs the browser to have been started with a debugging port
-  (`--remote-debugging-port`; `--remote-debugging-pipe` publishes no port).
-  A browser is asked at most once per minute while requests are running, and an
-  unauthorized answer drops that reuse at once.
+  Windows values are opened with the DPAPI-protected key in the user data
+  directory's `Local State`, macOS with its Keychain entry, Linux with
+  `secret-tool`. A `v20` (app-bound) value is reported rather than guessed at.
+  When the store cannot be read - a browser holds it open, or the values are
+  app-bound - a running Chromium is asked over the debugging port its user data
+  directory writes to `DevToolsActivePort`: one local WebSocket read that never
+  writes anything. That fallback needs the browser to have been started with a
+  debugging port (`--remote-debugging-port`; `--remote-debugging-pipe` publishes
+  no port). A browser is asked at most once per minute while requests are
+  running, and an unauthorized answer drops that reuse at once.
 - **Notion web session (paste the Cookie header)** for browsers this build
   cannot read: the complete Cookie request header of the user's own Notion web
   session, an optional workspace UUID and an optional active-user UUID when the
   browser holds several Notion identities.
 
 A container or server with no desktop browser can point this build at a
-Chromium profile directory that was prepared ahead of time (or kept after one
+Chromium **user data directory** prepared ahead of time (or kept after one
 sign-in): set `NOTION_BROWSER_PROFILE` or `MAGPIE_NOTION_BROWSER_PROFILE` to
 one or more such directories, separated the way the platform separates paths
-(`;` on Windows, `:` on macOS and Linux). A named directory is the profile
-directory itself, the one holding `Cookies` (`Network/Cookies` or `Cookies`)
-and `Local State`, and those directories are read before the system's own
-Chrome, Edge, Brave and Chromium locations; a directory named in both
-variables is read once. A directory holding only a `DevToolsActivePort` is
-asked over that debugging port instead. Mount the profile directory alone
+(`;` on Windows, `:` on macOS and Linux). A named directory is the user data
+directory itself, the one `--user-data-dir` names: `Local State` and, while a
+browser is running, `DevToolsActivePort` are at its root, and the profiles
+(`Default`, `Profile 1`, ...) sit below it, each keeping its cookies in
+`Network/Cookies` (or `Cookies`). Those directories are read before the
+system's own Chrome, Edge, Brave and Chromium locations; a directory named in
+both variables is read once. A directory holding only a `DevToolsActivePort` is
+asked over that debugging port instead. Mount that one user data directory
 rather than a whole user or home directory, and never expose a debugging port
 beyond the machine itself.
 
