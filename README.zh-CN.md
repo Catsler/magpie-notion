@@ -1,6 +1,6 @@
 # magpie-notion
 
-版本：0.2.4
+版本：0.2.5
 
 `magpie-notion` 是一个把 Notion AI 接入 Magpie / OpenCode 的非官方插件。它使用
 Notion 网页客户端所调用的内部接口，不是 Notion 的公开 Integration API；Notion
@@ -51,3 +51,6 @@ Magpie 添加插件时会安装运行依赖。运行时 provider id 仍是 `noti
 这个值等同于登录状态。只粘贴到自己的 Magpie，不要发到聊天、工单或 Git 仓库。
 失效后按同样的步骤重新复制。
 
+复制时要整段选中。以 `v03:` 开头的值中间有好几段，用点号分开；少了最后一段时 Notion 会直接拒绝。会话被拒绝后，插件只能显示内置的一个占位模型，用量也是空的。请重新复制完整的 `token_v2`，不要把这个值发到聊天里。
+
+每个账号同时发出的请求不限制。如果在 Magpie 里给 Notion 单独设了并发，以那个设置为准。

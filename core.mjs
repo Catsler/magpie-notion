@@ -160,7 +160,8 @@ export function createPlugin(protocol, options = {}) {
     },
     auth: {
       provider: ID,
-      maxConcurrency: 1,
+      // 0 means Magpie does not limit how many requests one account has in flight.
+      maxConcurrency: 0,
       methods: [
         { type: "api", label: "粘贴 token_v2", placeholder: "只粘贴 token_v2" },
       ],
