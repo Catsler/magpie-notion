@@ -7,6 +7,9 @@
 Notion 改版后可能失效；开发跟踪
 [magpie-community/plugins#118](https://github.com/magpie-community/plugins/issues/118)。
 
+插件图标使用 Notion 官方黑白 N 方块标志，源文件保存在 `notion.svg`，
+并内嵌到包元数据里。名称与标志属于 Notion；本项目是非官方插件。
+
 ## 安装
 
 ```sh
@@ -18,16 +21,29 @@ magpie plugin login notion
 
 - **直接用本机浏览器里已登录的 Notion 会话**（默认方式）。插件会按
   Chrome、Edge、Brave、Chromium、Firefox 的顺序去找本机的 cookie 库，
-  先复制再打开，不会干扰正在运行的浏览器。Windows 用 profile 里
+  先复制再打开，不会干扰正在运行的浏览器。Windows 用 user data 目录里
   `Local State` 的 DPAPI 密钥解密，macOS 走钥匙串，Linux 走 `secret-tool`；
   `v20`（app-bound）这类解不开的值会如实报错，不会瞎猜。库读不动时
   （浏览器占着文件，或值是 app-bound），再问正在运行的 Chromium：
-  读它 profile 里的 `DevToolsActivePort`，用一次本地 WebSocket 只读地问它自己的
-  cookie。走这条路要求浏览器是带调试端口启动的（`--remote-debugging-port`，
-  `--remote-debugging-pipe` 不开放端口）。请求密集时，同一个浏览器最多每
-  分钟问一次；一旦请求返回 401，这个复用立刻作废、下次重新读。
+  读它 user data 目录里的 `DevToolsActivePort`，用一次本地 WebSocket 只读地问
+  它自己的 cookie。走这条路要求浏览器是带调试端口启动的
+  （`--remote-debugging-port`，`--remote-debugging-pipe` 不开放端口）。
+  请求密集时，同一个浏览器最多每分钟问一次；一旦请求返回 401，这个复用立刻
+  作废、下次重新读。
 - **手动粘贴 Cookie 请求头**：给本插件读不了的浏览器用。填你本人 Notion
   网页会话的完整 Cookie 请求头，`spaceId`、activeUserId 都可留空。
+
+没有桌面浏览器的容器或服务器，可以把事先准备好（或登录一次后保留下来）的
+Chromium **user data 目录**指给插件：设 `NOTION_BROWSER_PROFILE` 或
+`MAGPIE_NOTION_BROWSER_PROFILE`，各接受一个或多个这样的目录，多个用当前平台的
+路径分隔符分隔（Windows 分号，macOS 与 Linux 冒号）。这里指的是 user data
+目录本身，也就是 `--user-data-dir` 指向的那个目录：`Local State` 和（浏览器
+运行时才有的）`DevToolsActivePort` 都在它的根上，具体的 profile（`Default`、
+`Profile 1`……）在它下面，各自的 cookie 库位于 `Network/Cookies`（或
+`Cookies`）。这些目录会排在系统默认的 Chrome、Edge、Brave、Chromium 位置之前
+优先读取，两个变量里重复出现的同一目录只读一次。目录里只有 `DevToolsActivePort`
+时，则改走该调试端口读取。注意：只挂载这个 user data 目录本身，不要挂载整个
+用户目录；调试端口不要暴露到公网。
 
 工作区（`spaceId`）是自动发现的：先问会话有哪些 space，再逐个用
 `getAvailableModels` 探测，第一个能答的就是当前工作区，那份模型表也就直接
@@ -52,6 +68,8 @@ OpenCode 的 auth store）；本插件不外传、不续期——会话过期就
 - 图片输入与客户端函数/工具调用被拒绝；Notion 自身的服务端工具可能仍然
   可用，因此不要把它当作隔离沙箱使用。
 - 会话过期后请在浏览器里重新登录；插件不代你续期，但会重新读取本机会话。
+- 额度响应完全读不出窗口时会报错，不会显示成空账号；正式回答比已流出的临时
+  文本短时以正式回答为准（SSE 已发出的部分无法撤回），整轮没有文本则报错。
 - 上下文长度等限制未公开，按“未知”处理（显示为 0），不会编造数值。
 - 每次推理总时长默认 5 分钟（`timeoutMs`）；从浏览器读到的会话默认复用
   60 秒（`browserReadMs`，设 0 表示每次都读）。

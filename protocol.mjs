@@ -16,6 +16,15 @@ function cookie(auth) {
   return auth.key.trim()
 }
 
+// A field the sign-in left blank is not a value: an unanswered optional prompt
+// is saved as an empty string, and a blank workspace or user must mean
+// "discover it" the same way an absent one does.
+function optional(value) {
+  if (value === undefined || value === null) return undefined
+  if (typeof value === "string" && !value.trim()) return undefined
+  return value
+}
+
 // credentials reads what the sign-in states: the Cookie header, and the
 // workspace and user where the account carries them. The workspace is not
 // required: an account without one has it resolved from the session itself, so
@@ -23,9 +32,9 @@ function cookie(auth) {
 function credentials(auth) {
   const key = cookie(auth)
   const metadata = auth?.metadata ?? {}
-  const spaceId = metadata.spaceId
+  const spaceId = optional(metadata.spaceId)
   if (spaceId !== undefined && (typeof spaceId !== "string" || !UUID.test(spaceId))) throw new ProviderError(400, "workspace_required", "The Notion workspace id must be a UUID.")
-  const activeUserId = metadata.activeUserId
+  const activeUserId = optional(metadata.activeUserId)
   if (activeUserId !== undefined && (typeof activeUserId !== "string" || !UUID.test(activeUserId))) throw new ProviderError(400, "invalid_active_user", "The Notion active user id must be a UUID.")
   return { cookie: key, spaceId, activeUserId }
 }
@@ -103,7 +112,7 @@ async function json(name, data, account, signal) {
 }
 
 function eligible(entry) {
-  return typeof entry?.model === "string" && typeof entry?.modelMessage === "string" && entry.agentService && !entry.agentService.isDisabled && !entry.isDisabled && !entry.restrictedForPersonalAgent
+  return typeof entry?.model === "string" && entry.model.trim().length > 0 && typeof entry?.modelMessage === "string" && entry.agentService && !entry.agentService.isDisabled && !entry.isDisabled && !entry.restrictedForPersonalAgent
 }
 
 async function catalog(account, signal, refresh = false) {
@@ -204,10 +213,19 @@ function quotaWindows(data) {
   if (!data || typeof data !== "object" || Array.isArray(data)) return undefined
   if (data.status === "not_applicable") return []
   const resolved = Array.isArray(data.allowances) ? data.allowances.filter((entry) => entry?.state === "resolved") : []
-  return [
-    data.window ? rollingWindow(data.window, data.resetsInSeconds) : rollingWindow(resolved.find((entry) => entry.cadence === "rolling"), data.resetsInSeconds),
-    data.billingPeriodWindow ? billingWindow(data.billingPeriodWindow) : billingWindow(resolved.find((entry) => entry.cadence === "billing_period")),
+  // A bucket is only skipped when the vendor left it unreadable: a window that
+  // does not read falls back to the allowance below it, and one that does reads
+  // even when the other does not.
+  const windows = [
+    (data.window ? rollingWindow(data.window, data.resetsInSeconds) : undefined) ?? rollingWindow(resolved.find((entry) => entry.cadence === "rolling"), data.resetsInSeconds),
+    (data.billingPeriodWindow ? billingWindow(data.billingPeriodWindow) : undefined) ?? billingWindow(resolved.find((entry) => entry.cadence === "billing_period")),
   ].filter(Boolean)
+  if (windows.length) return windows
+  // Buckets the vendor itself marked unexposed are an understood answer - it
+  // names what it will not show. Anything else that reads no window is an
+  // unreadable response, which is an error to show, never an empty account.
+  const withheld = Array.isArray(data.allowances) && data.allowances.length > 0 && data.allowances.every((entry) => entry?.state === "not_exposed")
+  return withheld ? [] : undefined
 }
 
 const quotaError = (error) =>
@@ -309,7 +327,7 @@ export default {
       try {
         for await (const event of transcriptEvents(frames(), signal, { afterSequence })) {
           if (event.type === "text") answer += event.text
-          else if (event.type === "done") remember(historyKey([...chat.messages, { role: "assistant", content: answer }]), threadId, event.sequence)
+          else if (event.type === "done") remember(historyKey([...chat.messages, { role: "assistant", content: typeof event.text === "string" ? event.text : answer }]), threadId, event.sequence)
           yield event
         }
       } finally { await liveResponse?.body?.cancel().catch(() => {}) }

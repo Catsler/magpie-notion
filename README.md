@@ -48,20 +48,35 @@ Two methods are offered, and neither asks for a workspace UUID:
   session out of the browser this machine is already signed in to: Chrome, Edge,
   Brave, Chromium or Firefox, on Windows, macOS and Linux, in that order. The
   store is copied before it is opened, so a running browser is not disturbed.
-  Windows values are opened with the DPAPI-protected key in the profile's
-  `Local State`, macOS with its Keychain entry, Linux with `secret-tool`. A
-  `v20` (app-bound) value is reported rather than guessed at. When the store
-  cannot be read - a browser holds it open, or the values are app-bound - a
-  running Chromium is asked over the debugging port its profile writes to
-  `DevToolsActivePort`: one local WebSocket read that never writes anything.
-  That fallback needs the browser to have been started with a debugging port
-  (`--remote-debugging-port`; `--remote-debugging-pipe` publishes no port).
-  A browser is asked at most once per minute while requests are running, and an
-  unauthorized answer drops that reuse at once.
+  Windows values are opened with the DPAPI-protected key in the user data
+  directory's `Local State`, macOS with its Keychain entry, Linux with
+  `secret-tool`. A `v20` (app-bound) value is reported rather than guessed at.
+  When the store cannot be read - a browser holds it open, or the values are
+  app-bound - a running Chromium is asked over the debugging port its user data
+  directory writes to `DevToolsActivePort`: one local WebSocket read that never
+  writes anything. That fallback needs the browser to have been started with a
+  debugging port (`--remote-debugging-port`; `--remote-debugging-pipe` publishes
+  no port). A browser is asked at most once per minute while requests are
+  running, and an unauthorized answer drops that reuse at once.
 - **Notion web session (paste the Cookie header)** for browsers this build
   cannot read: the complete Cookie request header of the user's own Notion web
   session, an optional workspace UUID and an optional active-user UUID when the
   browser holds several Notion identities.
+
+A container or server with no desktop browser can point this build at a
+Chromium **user data directory** prepared ahead of time (or kept after one
+sign-in): set `NOTION_BROWSER_PROFILE` or `MAGPIE_NOTION_BROWSER_PROFILE` to
+one or more such directories, separated the way the platform separates paths
+(`;` on Windows, `:` on macOS and Linux). A named directory is the user data
+directory itself, the one `--user-data-dir` names: `Local State` and, while a
+browser is running, `DevToolsActivePort` are at its root, and the profiles
+(`Default`, `Profile 1`, ...) sit below it, each keeping its cookies in
+`Network/Cookies` (or `Cookies`). Those directories are read before the
+system's own Chrome, Edge, Brave and Chromium locations; a directory named in
+both variables is read once. A directory holding only a `DevToolsActivePort` is
+asked over that debugging port instead. Mount that one user data directory
+rather than a whole user or home directory, and never expose a debugging port
+beyond the machine itself.
 
 The workspace (`spaceId`) does not have to be typed. The session is asked for
 its spaces and each candidate is probed with `getAvailableModels` until one
@@ -122,8 +137,9 @@ not zero, and a missing reset stays missing instead of being inferred from a
 window's span. `getAIUsageEligibilityV2` adds the premium credit balance when
 the workspace exposes it; a metadata error or missing field there never hides
 the standard windows. An HTTP 401 on the quota read marks the sign-in
-`expired`; other failures are sanitized errors. Neither the session cookie,
-the workspace UUID nor raw upstream bodies appear in the result.
+`expired`; other failures are sanitized errors, and a response that reads no
+window at all is an error rather than an empty account. Neither the session
+cookie, the workspace UUID nor raw upstream bodies appear in the result.
 
 ## Conversation behavior and limitations
 
@@ -132,8 +148,12 @@ network requests go only to `https://app.notion.com/api/v3/` through the adapter
 It creates a Notion personal-agent thread and reads its transcript page before
 following the live NDJSON stream. Both buffered Chat Completions JSON and SSE
 output are supported. Provisional assistant-message updates are deduplicated
-when Notion replaces them with their committed version. An explicit successful
-turn-completion event is required; EOF is never treated as success.
+when Notion replaces them with their committed version. When a committed
+message turns out shorter than provisional text that was already streamed, the
+committed message stays the answer: a buffered response reports it, and bytes
+already sent over SSE cannot be taken back. A turn that completes without any
+text is an error, not an empty answer. An explicit successful turn-completion
+event is required; EOF is never treated as success.
 
 The initial conversation is serialized into a text wrapper containing role
 labels. This is **not native system/developer role isolation**. Subsequent
@@ -218,6 +238,10 @@ Capture only the relevant requests. Redact session tokens and workspace/user
 identifiers before adding fixtures; never commit a raw HAR.
 
 ## Applicable terms
+
+The plugin icon is Notion's [official block logo](https://app.notion.com/images/notion-logo-block-main.svg),
+stored in `notion.svg` and embedded in the package metadata. Notion's name and
+logo belong to Notion; this is an unofficial plugin.
 
 Review the account's agreement and
 [Notion AI and Notion Credit Supplementary Terms](https://notion.notion.site/Notion-AI-and-Notion-Credit-Supplementary-Terms-fa9034c8b5a04818a6baf3eac2adddbb),
