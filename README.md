@@ -1,4 +1,4 @@
-# opencode-notion-auth
+# magpie-notion
 
 Notion AI (Business) as a magpie / OpenCode provider: sign in with your own
 Notion web session, use the live model catalog of a workspace that has Notion
