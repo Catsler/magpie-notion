@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto"
 import { ProviderError } from "./core.mjs"
+import { exchange } from "./direct.mjs"
 import { readNDJSON, transcriptEvents, sessionError } from "./transcript.mjs"
 
 const ORIGIN = "https://app.notion.com"
@@ -9,8 +10,6 @@ const catalogs = new Map()
 const TTL = 30 * 60 * 1000
 const digest = (value) => createHash("sha256").update(JSON.stringify(value)).digest("hex")
 const moduleFetch = globalThis.fetch
-let impitClient
-let impitLoading
 
 // A stable UUID for Notion's device cookie. The session token selects it, so
 // repeated requests look like one browser without writing a new identifier
@@ -58,35 +57,22 @@ function normalizeCookie(header, activeUserId) {
   return fields.map((field) => field.value === undefined ? field.name : `${field.name}=${field.value}`).join("; ")
 }
 
-async function impit() {
-  if (impitClient) return impitClient
-  if (!impitLoading) {
-    impitLoading = import("impit")
-      .then(({ Impit }) => (impitClient = new Impit({ browser: "chrome", followRedirects: false })))
-      .catch(() => {
-        impitLoading = undefined
-        throw new ProviderError(503, "transport_unavailable", "Reinstall the plugin so Magpie can install its impit dependency.")
-      })
-  }
-  return impitLoading
-}
-
+// request is the seam every call goes through. Thread creation is the one
+// endpoint that reads where Host sits and which client is asking, so it is
+// written by direct.mjs rather than by fetch; everything else, including the
+// transcript stream, is an ordinary fetch. Tests replace the global fetch after
+// this module loads, so the mock observes creation too and no suite opens a
+// socket.
 async function request(name, url, init) {
-  // Only thread creation needs Chrome's browser fingerprint. Tests replace the
-  // global fetch after this module loads, so the mock also observes creation
-  // and the suite never imports impit's native dependency.
   if (name !== "createAgentThread" || globalThis.fetch !== moduleFetch) return globalThis.fetch(url, init)
-  const client = await impit()
+  let answer
   try {
-    return await client.fetch(url, init)
+    answer = await exchange(url, init.headers, init.body, { signal: init.signal })
   } catch (error) {
-    // Some impit builds reject the request-level redirect option. The shared
-    // client still refuses to follow redirects, so omitting it is safe: a 3xx
-    // response reaches call() and becomes an error there.
-    if (!/redirect/i.test(String(error?.message ?? ""))) throw error
-    const { redirect, ...withoutRedirect } = init
-    return client.fetch(url, withoutRedirect)
+    if (error?.name === "AbortError") throw error
+    throw new ProviderError(502, "transport_failed", `Notion could not be reached: ${error?.message ?? error}`)
   }
+  return new Response(answer.text, { status: answer.status, headers: answer.headers })
 }
 
 // Accept either the token value by itself or a Cookie header the user pasted by
@@ -130,12 +116,20 @@ function credentials(auth) {
   return { cookie: key, spaceId, activeUserId }
 }
 
-async function call(name, data, account, signal) {
+// WEB_AGENT is the client the edge expects to be talking to. createAgentThread
+// answers "UserValidationError" to the runtime's own name (Bun/1.4, node, or
+// nothing at all) however valid the cookies and the body are, so the request
+// states a browser even though this is not one. Host's position is the other
+// half of what that endpoint reads, and direct.mjs is what puts it first.
+const WEB_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
+
+function requestHeaders(account, name) {
   const headers = {
     Accept: name === "listenToThreadTranscript" ? "application/x-ndjson" : "application/json",
     "Content-Type": "application/json",
     Cookie: normalizeCookie(account.cookie, account.activeUserId),
     Origin: ORIGIN,
+    "User-Agent": WEB_AGENT,
     "notion-audit-log-platform": "web",
     "Sec-Fetch-Dest": "empty",
     "Sec-Fetch-Mode": "cors",
@@ -143,9 +137,13 @@ async function call(name, data, account, signal) {
   }
   if (account.spaceId) headers["x-notion-space-id"] = account.spaceId
   if (account.activeUserId) headers["x-notion-active-user-header"] = account.activeUserId
+  return headers
+}
+
+async function call(name, data, account, signal) {
   const response = await request(name, `${ORIGIN}/api/v3/${name}`, {
     method: "POST",
-    headers,
+    headers: requestHeaders(account, name),
     body: JSON.stringify(data), signal, redirect: "error",
   })
   if (!response.ok) {
@@ -452,4 +450,4 @@ export default {
   usage: quota,
 }
 
-export const _internal = { cookie, credentials, accountOf, workspace, resolved, RESOLVED_TTL, keepModels, initialText, content, sessions, catalogs, eligible, modelEntry, percent, rollingWindow, billingWindow, quotaWindows }
+export const _internal = { cookie, credentials, accountOf, workspace, resolved, RESOLVED_TTL, keepModels, initialText, content, sessions, catalogs, eligible, modelEntry, percent, rollingWindow, billingWindow, quotaWindows, requestHeaders, WEB_AGENT }

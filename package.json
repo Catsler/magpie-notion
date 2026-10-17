@@ -14,9 +14,6 @@
   "engines": {
     "node": ">=20"
   },
-  "dependencies": {
-    "impit": "0.14.6"
-  },
   "keywords": [
     "opencode",
     "opencode-plugin",
@@ -28,6 +25,7 @@
     "README.md",
     "check.mjs",
     "core.mjs",
+    "direct.mjs",
     "index.mjs",
     "protocol.mjs",
     "session.mjs",

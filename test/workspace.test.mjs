@@ -104,7 +104,7 @@ test("the create request uses Chrome web headers and a normalized Cookie", async
   for await (const event of await protocol.open({ auth: stated, chat, signal: AbortSignal.timeout(5_000) })) void event
   const created = mock.calls.find((call) => call.name === "createAgentThread")
   const listen = mock.calls.find((call) => call.name === "listenToThreadTranscript")
-  // The replaced fetch observes creation too; impit is not imported in tests.
+  // The replaced fetch observes creation too; no socket is opened in tests.
   expect(mock.names().filter((name) => name === "createAgentThread")).toHaveLength(1)
   expect(created.headers.Accept).toBe("application/json")
   expect(listen.headers.Accept).toBe("application/x-ndjson")
