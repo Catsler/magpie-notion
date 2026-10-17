@@ -34,28 +34,20 @@ Magpie 添加插件时会安装运行依赖。运行时 provider id 仍是 `noti
 再通过模型目录确认当前工作区。`token_v2` 只交给宿主自己的认证存储保存，不要
 写进源码、命令参数、日志或提交记录。
 
-## 功能
+### 获取 `token_v2`
 
-- provider 名称为 `notion`，模型列表来自当前工作区的实时模型目录。
-- 支持流式 SSE 和缓冲 JSON 两种聊天响应。
-- `auth.usage` 会读取额度窗口；工作区提供 premium credits 时也会显示余额。
-- 创建会话使用 `impit` 的 Chrome 客户端；模型目录、额度和转写使用普通 HTTP。
-- 聊天不需要容器里运行浏览器。
+`token_v2` 是 Notion 网页登录后保存在你自己浏览器里的会话值。只使用你自己的账号。
 
-## 限制
+1. 用浏览器打开 https://www.notion.so 并登录，进入任意工作区。
+2. 打开开发者工具。Windows 和 Linux 按 F12，macOS 按 Option-Command-I。
+3. 选择「应用」或 Application，左侧展开 Cookie，点选 `https://www.notion.so`。
+4. 找到名称正好是 `token_v2` 的一行，只复制它的值；不要复制名称，也不要复制整段 Cookie。
+5. 回到 Magpie 的 Notion 登录页，把值粘贴进「粘贴 token_v2」。
 
-- 需要账号和工作区本身具备 Notion AI 权限。
-- 当前只接受文本输入；图片和客户端工具调用会被拒绝。
-- 工作区自动发现依赖当前 `token_v2` 对应的 Notion 会话。
-- `token_v2` 失效后，需要重新登录并粘贴新的值。
-- 插件不能保证 Notion 网页端内部接口长期稳定。
-- Notion 自身的服务端工具可能仍然可用，因此不要把它当作隔离沙箱。
-- 每次推理有总时限，默认 5 分钟；可通过插件选项 `timeoutMs` 调整。
+如果没有「应用」面板，可以打开「网络」或 Network，刷新页面，点开任意一个发往
+`www.notion.so` 的请求，在请求头 Cookie 中找到 `token_v2=`，复制等号后面、下一个
+分号前面的内容。
 
-## 自检
+这个值等同于登录状态。只粘贴到自己的 Magpie，不要发到聊天、工单或 Git 仓库。
+失效后按同样的步骤重新复制。
 
-```sh
-bun test
-node check.mjs
-node scripts/check-secrets.mjs
-```
