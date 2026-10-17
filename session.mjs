@@ -451,8 +451,16 @@ function toBuffer(value) {
 // browsers open the Cookies database so that nothing else may read it, which a
 // running browser reports as EBUSY/EPERM; that is the one failure the caller
 // can fix by closing the browser, so it gets its own words.
+//
+// macOS reports the same errno for a different thing: the system denies this
+// app the browser's data directory until it is given Full Disk Access, and no
+// browser needs to be running for that. Telling the two apart matters, because
+// "close the browser" is advice that never works on the permission one - the
+// read fails again the moment it is retried, which reads as a sign-in that can
+// never be made.
 export function copyToTemporary(store, options = {}) {
   const copy = options.copyFile ?? copyFileSync
+  const platform = options.platform ?? process.platform
   const directory = mkdtempSync(join(tmpdir(), "magpie-notion-"))
   const path = join(directory, "cookies.db")
   try {
@@ -460,6 +468,9 @@ export function copyToTemporary(store, options = {}) {
   } catch (error) {
     discard(directory)
     const code = error?.code
+    if (platform === "darwin" && (code === "EPERM" || code === "EACCES")) {
+      throw new SessionError(`macOS does not let this app read ${store.browser}'s data; give magpie Full Disk Access in System Settings › Privacy & Security › Full Disk Access and sign in again, or sign in with the Notion web session (paste the Cookie header)`, "permission")
+    }
     if (code === "EBUSY" || code === "EPERM" || code === "EACCES") {
       throw new SessionError(`${store.browser} is running and holds its cookie store open; close ${store.browser} and sign in again`, "locked")
     }
@@ -513,7 +524,15 @@ async function valueKey(store, options) {
     return dpapi(raw.subarray(5), run)
   }
   const secret = platform === "darwin" ? await keychainSecret(store, run) : await secretServiceKey(store, run)
-  if (!secret) throw new SessionError("the desktop's keychain did not give up its cookie key", "unsupported-encryption")
+  if (!secret) {
+    // On macOS the key lives in the login keychain and its ACL is written for
+    // the browser that put it there: another app reading it is a decision the
+    // user is asked to make, and a refusal leaves nothing to decrypt with. The
+    // way out is the sign-in that does not need the key at all.
+    throw new SessionError(platform === "darwin"
+      ? "the login keychain did not give up this browser's cookie key; allow magpie to read it when macOS asks, or sign in with the Notion web session (paste the Cookie header)"
+      : "the desktop's keychain did not give up its cookie key", "unsupported-encryption")
+  }
   return { cipher: "cbc", key: pbkdf2Sync(secret, "saltysalt", platform === "darwin" ? 1003 : 1, 16, "sha1") }
 }
 

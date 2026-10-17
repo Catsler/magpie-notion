@@ -274,9 +274,29 @@ test("a locked store is reported in the words a user can act on", () => {
   expect(error).toBeInstanceOf(SessionError)
   expect(error.reason).toBe("locked")
   expect(error.message).toContain("close Chrome")
+  // Windows reports a held-open store the same way, so there the words that
+  // name the fix a user can carry out are kept.
   for (const code of ["EPERM", "EACCES"]) {
-    const denied = capture(() => copyToTemporary({ browser: "Edge", db: "x" }, { copyFile: () => { const failure = new Error("denied"); failure.code = code; throw failure } }))
+    const denied = capture(() => copyToTemporary({ browser: "Edge", db: "x" }, { copyFile: () => { const failure = new Error("denied"); failure.code = code; throw failure }, platform: "win32" }))
     expect(denied.reason).toBe("locked")
+  }
+})
+
+// macOS answers EPERM for a different thing than Windows does: the system
+// refuses, not the browser, and no browser has to be running for it. Closing
+// the browser is advice that never works there, so sharing one message would
+// turn a sign-in that one setting fixes into one that reads as unfixable.
+test("macOS's refusal to read a browser is told apart from a locked store", () => {
+  for (const code of ["EPERM", "EACCES"]) {
+    const denied = capture(() => copyToTemporary({ browser: "Chrome", db: "x" }, { copyFile: () => { const failure = new Error("Operation not permitted"); failure.code = code; throw failure }, platform: "darwin" }))
+    expect(denied).toBeInstanceOf(SessionError)
+    expect(denied.reason).toBe("permission")
+    expect(denied.message).toContain("Full Disk Access")
+    expect(denied.message).not.toContain("close Chrome")
+  }
+  // A failure that is neither is still reported as itself, on every platform.
+  for (const platform of ["darwin", "win32"]) {
+    expect(capture(() => copyToTemporary({ browser: "Chrome", db: "x" }, { copyFile: () => { const failure = new Error("nope"); failure.code = "EIO"; throw failure }, platform })).reason).toBe("unreadable")
   }
 })
 
@@ -437,15 +457,30 @@ test("a read that times out is tried once more, and a refusal is not", async () 
   }
 })
 
-test("the browser sign-in takes the session that is there, asking nothing", async () => {
+test("the browser sign-in opens the sign-in page and takes the session that is there", async () => {
   const session = { findSession: async () => ({ cookie: `token_v2=live-session; notion_user_id=${USER}`, browser: "Edge", profile: "Default", activeUserId: USER }) }
   const plugin = createPlugin(protocol, { session })
   const method = plugin.auth.methods.find((entry) => entry.type === "oauth")
   expect(method.label).toBe("Use the Notion session in this browser")
   const start = await method.authorize()
-  expect(start).toMatchObject({ url: "", method: "auto" })
+  // The page is what the host has to open: an empty url leaves a sign-in that
+  // cannot be made when the read is refused, with nothing for the user to do.
+  expect(start.url).toBe("https://www.notion.so/login")
+  expect(start.method).toBe("auto")
   expect(typeof start.callback).toBe("function")
   expect(await start.callback()).toEqual({ type: "success", key: `token_v2=live-session; notion_user_id=${USER}`, metadata: { browser: "Edge", profile: "Default", activeUserId: USER } })
+})
+
+test("a refused read names its own fix, and every other failure names the way out", async () => {
+  const refusing = createPlugin(protocol, { session: { findSession: async () => { throw new SessionError("macOS does not let this app read Chrome's data; give magpie Full Disk Access …", "permission") } } })
+  const denied = await (await refusing.auth.methods.find((entry) => entry.type === "oauth").authorize()).callback()
+  expect(denied.type).toBe("failed")
+  expect(denied.error).toContain("Full Disk Access")
+  const missing = createPlugin(protocol, { session: { findSession: async () => { throw new SessionError("Chrome (Default) has no Notion session", "no-session") } } })
+  const absent = await (await missing.auth.methods.find((entry) => entry.type === "oauth").authorize()).callback()
+  expect(absent.type).toBe("failed")
+  expect(absent.error).toContain("has no Notion session")
+  expect(absent.error).toContain("paste the Cookie header")
 })
 
 test("a store this build cannot open fails the sign-in with the reason, not a generic error", async () => {

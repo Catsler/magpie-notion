@@ -148,15 +148,34 @@ function scopedSignal(signal, timeoutMs) {
   } }
 }
 
+// The web client's own sign-in page. A method that shows nothing leaves a
+// sign-in that fails with no way out of it: reading a browser is not always
+// possible - macOS denies an app the browser's data directory until it is
+// given Full Disk Access, and the login keychain may refuse the cookie key -
+// and the user then has no page to open and nothing to act on. Naming the page
+// makes the session this read looks for one that can actually be created.
+const SIGN_IN_URL = "https://www.notion.so/login"
+
+// signInFailure turns what went wrong into a next step. A browser this app is
+// not allowed to read already says which permission fixes it; every other
+// failure - no Notion account in any browser here, a store that would not open,
+// a keychain that refused - is answered by the method that asks for the Cookie
+// header instead, which needs neither permission nor a running browser.
+function signInFailure(error) {
+  const message = error instanceof Error ? error.message : "The Notion session in this machine's browser could not be read."
+  if (error?.reason === "permission") return message
+  return `${message} Or sign in with "Notion web session (paste the Cookie header)".`
+}
+
 // browserSignIn takes the Notion session of the browser this machine is already
 // signed in to, the way the other magpie plugins take the sign-in of the app
-// they belong to. Nothing is asked and nothing is shown: the method resolves on
-// its own, and the workspace is discovered from the session later, so nobody
+// they belong to. The page is opened first so a browser that was not signed in
+// yet can be, and the workspace is discovered from the session later, so nobody
 // has to paste a UUID.
 async function browserSignIn(session) {
   return {
-    url: "",
-    instructions: "Reads the Notion session from the Chrome, Edge, Brave, Chromium or Firefox profile on this machine.",
+    url: SIGN_IN_URL,
+    instructions: "Sign in to Notion in this browser if you are not already signed in there. Magpie then reads that session from the Chrome, Edge, Brave, Chromium or Firefox profile on this machine. If it cannot be read, use \"Notion web session (paste the Cookie header)\" instead.",
     method: "auto",
     callback: async () => {
       try {
@@ -167,7 +186,7 @@ async function browserSignIn(session) {
           metadata: { browser: found.browser, profile: found.profile, ...(found.via ? { via: found.via } : {}), ...(found.activeUserId ? { activeUserId: found.activeUserId } : {}) },
         }
       } catch (error) {
-        return { type: "failed", error: error instanceof Error ? error.message : "The Notion session in this machine's browser could not be read." }
+        return { type: "failed", error: signInFailure(error) }
       }
     },
   }
