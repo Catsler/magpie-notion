@@ -192,6 +192,43 @@ test("the desktop keychain is asked under the name each browser files its key as
   expect(asked[0]).toEqual(["secret-tool", "lookup", "application", "microsoft-edge"])
 })
 
+test("a Linux basic store opens with its fixed passphrase when the sign-in service gives no value", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "magpie-basic-store-"))
+  try {
+    const derived = pbkdf2Sync(_internal.BASIC_STORE_PASSPHRASE, "saltysalt", 1, 16, "sha1")
+    const rows = [
+      { name: "token_v2", encrypted_value: cbcSeal("synthetic-session", derived), host: ".app.notion.com" },
+      { name: "notion_user_id", encrypted_value: cbcSeal(USER, derived), host: ".app.notion.com" },
+    ]
+    const store = { kind: "chromium", browser: "Chromium", profile: "Default", db: join(directory, "Cookies"), localState: join(directory, "Local State") }
+    const found = await findSession({
+      ...temporary,
+      platform: "linux",
+      stores: [store],
+      openDatabase: () => database(rows),
+      run: async () => { throw new Error("no sign-in service") },
+    })
+    expect(found).toEqual({ cookie: `token_v2=synthetic-session; notion_user_id=${USER}`, browser: "Chromium", profile: "Default", activeUserId: USER })
+
+    // A value this passphrase cannot open keeps the original service failure.
+    const cipher = createCipheriv("aes-128-cbc", derived, Buffer.alloc(16, " "))
+    cipher.setAutoPadding(false)
+    const invalid = Buffer.concat([Buffer.from("v10"), cipher.update(Buffer.alloc(16)), cipher.final()])
+    const denied = await captureAsync(() => findSession({
+      ...temporary,
+      platform: "linux",
+      stores: [store],
+      openDatabase: () => database([{ name: "token_v2", encrypted_value: invalid, host: ".app.notion.com" }]),
+      run: async () => "",
+    }))
+    expect(denied).toBeInstanceOf(SessionError)
+    expect(denied.reason).toBe("no-session")
+    expect(denied.message).toContain("keychain did not give up")
+  } finally {
+    remove(directory)
+  }
+})
+
 test("a readStore copy is taken back after it has been read", async () => {
   const directory = mkdtempSync(join(tmpdir(), "magpie-copy-"))
   const before = leftovers().length
@@ -337,8 +374,11 @@ test("a profile that is running names its debugging port, and one that is not na
   try {
     const root = join(home, "Root")
     mkdirSync(root)
-    writeFileSync(join(root, "DevToolsActivePort"), "9222\n/devtools/browser/9aa60052-e2ea-4127-b4cc-84a58e813c97\n")
-    expect(_internal.devtoolsEndpoint({ root })).toBe("ws://127.0.0.1:9222/devtools/browser/9aa60052-e2ea-4127-b4cc-84a58e813c97")
+    writeFileSync(join(root, "DevToolsActivePort"), "9222\n/devtools/browser/devtools-path\n")
+    expect(_internal.devtoolsEndpoint({ root })).toBe("ws://127.0.0.1:9222/devtools/browser/devtools-path")
+    writeFileSync(join(root, "DevToolsHost"), "magpie-notion-browser\n")
+    expect(_internal.devtoolsEndpoint({ root })).toBe("ws://magpie-notion-browser:9222/devtools/browser/devtools-path")
+    rmSync(join(root, "DevToolsHost"))
     writeFileSync(join(root, "DevToolsActivePort"), "not a port\n")
     expect(_internal.devtoolsEndpoint({ root })).toBeUndefined()
     expect(_internal.devtoolsEndpoint({ root: join(home, "Missing") })).toBeUndefined()
@@ -439,6 +479,32 @@ test("a read that times out is tried once more, and a refusal is not", async () 
   }
 })
 
+test("a debugging port that never opens has a short connection limit", async () => {
+  const real = globalThis.WebSocket
+  const attempts = []
+  class HangingWebSocket {
+    constructor(endpoint) {
+      this.listeners = {}
+      attempts.push(endpoint)
+    }
+    addEventListener(type, handler) { (this.listeners[type] ??= []).push(handler) }
+    send() {}
+    close() {}
+  }
+  globalThis.WebSocket = HangingWebSocket
+  try {
+    const started = Date.now()
+    const error = await captureAsync(() => _internal.connectDevtools("ws://magpie-notion-browser:9222/devtools/browser/devtools-path", 1_000, 10))
+    expect(error).toBeInstanceOf(SessionError)
+    expect(error.reason).toBe("devtools-timeout")
+    expect(error.message).toContain("could not be reached")
+    expect(attempts).toHaveLength(2)
+    expect(Date.now() - started).toBeLessThan(500)
+  } finally {
+    globalThis.WebSocket = real
+  }
+})
+
 test("the browser sign-in takes the session that is there, asking nothing", async () => {
   const session = { findSession: async () => ({ cookie: `token_v2=live-session; notion_user_id=${USER}`, browser: "Edge", profile: "Default", activeUserId: USER }) }
   const plugin = createPlugin(protocol, { session })
@@ -448,6 +514,75 @@ test("the browser sign-in takes the session that is there, asking nothing", asyn
   expect(start).toMatchObject({ url: "", method: "auto" })
   expect(typeof start.callback).toBe("function")
   expect(await start.callback()).toEqual({ type: "success", key: `token_v2=live-session; notion_user_id=${USER}`, metadata: { browser: "Edge", profile: "Default", activeUserId: USER } })
+})
+
+test("a container sign-in opens the configured page and polls for the session", async () => {
+  const session = {
+    findSession: async () => {
+      reads++
+      if (reads < 3) throw new SessionError("No browser profile was found", "no-browser")
+      return { cookie: "synthetic-session", browser: "Chromium", profile: "Default", via: "devtools" }
+    },
+  }
+  let reads = 0
+  const plugin = createPlugin(protocol, {
+    session,
+    env: { MAGPIE_WEB_URL: "https://magpie.test/base/" },
+    signInPollMs: 1,
+    signInTimeoutMs: 200,
+  })
+  const method = plugin.auth.methods.find((entry) => entry.type === "oauth")
+  expect(method.prompts).toBeUndefined()
+  const start = await method.authorize()
+  expect(start).toMatchObject({
+    url: "https://magpie.test/base/notion-login/",
+    instructions: "Open the page, sign in to Notion in its browser, then wait here; this will continue automatically.",
+    method: "auto",
+  })
+  expect(await start.callback()).toEqual({
+    type: "success",
+    key: "synthetic-session",
+    metadata: { browser: "Chromium", profile: "Default", via: "devtools" },
+  })
+  expect(reads).toBe(3)
+})
+
+test("the direct sign-in address wins over the Magpie web address", async () => {
+  const session = { findSession: async () => { throw new SessionError("No browser profile was found", "no-browser") } }
+  const plugin = createPlugin(protocol, {
+    session,
+    env: { NOTION_SIGNIN_URL: "https://sign-in.test/notion", MAGPIE_WEB_URL: "https://magpie.test/base/" },
+    signInPollMs: 1,
+    signInTimeoutMs: 1,
+  })
+  const start = await plugin.auth.methods.find((entry) => entry.type === "oauth").authorize()
+  expect(start.url).toBe("https://sign-in.test/notion")
+})
+
+test("a container sign-in without a configured page fails readably and invents no address", async () => {
+  const session = { findSession: async () => { throw new SessionError("No Chrome, Edge, Brave, Chromium or Firefox profile was found", "no-browser") } }
+  const plugin = createPlugin(protocol, { session, env: {} })
+  const start = await plugin.auth.methods.find((entry) => entry.type === "oauth").authorize()
+  expect(start.url).toBe("")
+  expect(start.method).toBe("auto")
+  const result = await start.callback()
+  expect(result.type).toBe("failed")
+  expect(result.error).toContain("No Chrome, Edge, Brave, Chromium or Firefox profile")
+})
+
+test("a sign-in page gives the container browser a bounded time to finish", async () => {
+  const session = { findSession: async () => { throw new SessionError("No browser profile was found", "no-browser") } }
+  const plugin = createPlugin(protocol, {
+    session,
+    env: { MAGPIE_WEB_URL: "https://magpie.test/base" },
+    signInPollMs: 1,
+    signInTimeoutMs: 5,
+  })
+  const start = await plugin.auth.methods.find((entry) => entry.type === "oauth").authorize()
+  expect(start.url).toBe("https://magpie.test/base/notion-login/")
+  const result = await start.callback()
+  expect(result.type).toBe("failed")
+  expect(result.error).toContain("did not finish within 3 minutes")
 })
 
 test("a store this build cannot open fails the sign-in with the reason, not a generic error", async () => {

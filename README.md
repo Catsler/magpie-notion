@@ -8,7 +8,7 @@ This speaks Notion's internal web client API, not the public integration API.
 It is unofficial and can break when Notion changes its client. Development
 follows [issue #118](https://github.com/magpie-community/plugins/issues/118).
 
-Status: development build, version 0.2.2. Its core protocol was captured from a
+Status: development build, version 0.2.3. Its core protocol was captured from a
 consenting account on 2026-10-16: model listing, new-thread creation, a
 streamed answer and a second turn worked in Notion's browser client. A
 browser-compatible bundle of these exact provider modules then listed 29
@@ -53,14 +53,18 @@ Two methods are offered, and neither asks for a workspace UUID:
   store is copied before it is opened, so a running browser is not disturbed.
   Windows values are opened with the DPAPI-protected key in the user data
   directory's `Local State`, macOS with its Keychain entry, Linux with
-  `secret-tool`. A `v20` (app-bound) value is reported rather than guessed at.
+  `secret-tool`, then Chromium's basic store when that service has no value. A
+  `v20` (app-bound) value is reported rather than guessed at.
   When the store cannot be read - a browser holds it open, or the values are
   app-bound - a running Chromium is asked over the debugging port its user data
   directory writes to `DevToolsActivePort`: one local WebSocket read that never
   writes anything. That fallback needs the browser to have been started with a
   debugging port (`--remote-debugging-port`; `--remote-debugging-pipe` publishes
   no port). A browser is asked at most once per minute while requests are
-  running, and an unauthorized answer drops that reuse at once.
+  running, and an unauthorized answer drops that reuse at once. When no session
+  is available, Magpie opens `NOTION_SIGNIN_URL` if set, otherwise
+  `MAGPIE_WEB_URL` with `notion-login/` appended. The button checks the browser
+  again every two seconds for up to three minutes.
 - **Notion web session (paste the Cookie header)** for browsers this build
   cannot read: the complete Cookie request header of the user's own Notion web
   session, an optional workspace UUID and an optional active-user UUID when the
@@ -71,6 +75,17 @@ in, chat does not keep the user's browser open and does not need a browser
 inside Docker. Only thread creation uses the installed impit Chrome client.
 Catalog, quota and transcript streaming stay on ordinary HTTP and do not need
 the user's browser or a browser inside Docker.
+
+### Docker sign-in
+
+The login button opens the `notion-login/` page under `MAGPIE_WEB_URL` (or the
+explicit `NOTION_SIGNIN_URL`) and polls until that browser is signed in. Keep
+its Chromium user data directory in a volume and name that directory with
+`NOTION_BROWSER_PROFILE` or `MAGPIE_NOTION_BROWSER_PROFILE`, so the container
+reads the same persistent profile after sign-in. `spaceId` is discovered from
+the signed-in session automatically; it is not part of the login form. If
+neither address is configured, the button reports the browser read failure and
+does not invent a public address.
 
 If sign-in should read a browser profile instead of a pasted Cookie, a
 container or server with no desktop browser can point this build at a Chromium
@@ -84,9 +99,10 @@ the one `--user-data-dir` names: `Local State` and, while a browser is running,
 (or `Cookies`). Those directories are read before the system's own Chrome,
 Edge, Brave and Chromium locations; a directory named in both variables is
 read once. A directory holding only a `DevToolsActivePort` is asked over that
-debugging port instead. Mount that one user data directory rather than a whole
-user or home directory, and never expose a debugging port beyond the machine
-itself.
+debugging port instead. A sidecar on another host may put its host name in a
+`DevToolsHost` file beside `DevToolsActivePort`. Mount that one user data
+directory rather than a whole user or home directory, and never expose a
+debugging port beyond the trusted machines.
 
 The workspace (`spaceId`) does not have to be typed. The session is asked for
 its spaces and each candidate is probed with `getAvailableModels` until one

@@ -4,6 +4,10 @@ import * as localSession from "./session.mjs"
 const ID = "notion"
 const VIRTUAL_API = "https://notion.invalid/v1"
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const SIGN_IN_INSTRUCTIONS = "Open the page, sign in to Notion in its browser, then wait here; this will continue automatically."
+const SIGN_IN_PATH = "notion-login/"
+const SIGN_IN_POLL_MS = 2_000
+const SIGN_IN_TIMEOUT_MS = 180_000
 const encoder = new TextEncoder()
 
 export class ProviderError extends Error {
@@ -148,27 +152,61 @@ function scopedSignal(signal, timeoutMs) {
   } }
 }
 
-// browserSignIn takes the Notion session of the browser this machine is already
-// signed in to, the way the other magpie plugins take the sign-in of the app
-// they belong to. Nothing is asked and nothing is shown: the method resolves on
-// its own, and the workspace is discovered from the session later, so nobody
-// has to paste a UUID.
-async function browserSignIn(session) {
+function signInUrl(env) {
+  const direct = String(env?.NOTION_SIGNIN_URL ?? "").trim()
+  if (direct) return direct
+  const web = String(env?.MAGPIE_WEB_URL ?? "").trim()
+  if (!web) return ""
+  return `${web.endsWith("/") ? web : `${web}/`}${SIGN_IN_PATH}`
+}
+
+function sessionSuccess(found) {
   return {
-    url: "",
-    instructions: "Reads the Notion session from the Chrome, Edge, Brave, Chromium or Firefox profile on this machine.",
+    type: "success",
+    key: found.cookie,
+    metadata: { browser: found.browser, profile: found.profile, ...(found.via ? { via: found.via } : {}), ...(found.activeUserId ? { activeUserId: found.activeUserId } : {}) },
+  }
+}
+
+function readableFailure(error) {
+  return { type: "failed", error: error instanceof Error ? error.message : "The Notion session in this machine's browser could not be read." }
+}
+
+// browserSignIn takes the Notion session of the browser this machine is already
+// signed in to. A container can instead open a page with a persistent browser,
+// then poll the same reader until that browser has completed sign-in. The
+// workspace is discovered from the session later, so nobody has to paste one.
+async function browserSignIn(session, options = {}) {
+  const read = () => session.findSession()
+  let found
+  let initialError
+  try {
+    found = await read()
+  } catch (error) {
+    initialError = error
+  }
+  const url = found ? "" : signInUrl(options.env ?? process.env)
+  const pollMs = options.pollMs ?? SIGN_IN_POLL_MS
+  const timeoutMs = options.timeoutMs ?? SIGN_IN_TIMEOUT_MS
+  return {
+    url,
+    instructions: SIGN_IN_INSTRUCTIONS,
     method: "auto",
     callback: async () => {
-      try {
-        const found = await session.findSession()
-        return {
-          type: "success",
-          key: found.cookie,
-          metadata: { browser: found.browser, profile: found.profile, ...(found.via ? { via: found.via } : {}), ...(found.activeUserId ? { activeUserId: found.activeUserId } : {}) },
-        }
-      } catch (error) {
-        return { type: "failed", error: error instanceof Error ? error.message : "The Notion session in this machine's browser could not be read." }
+      if (found) return sessionSuccess(found)
+      if (!url) return readableFailure(initialError)
+      const deadline = Date.now() + timeoutMs
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, pollMs)
+          timer.unref?.()
+        })
+        try {
+          found = await read()
+          return sessionSuccess(found)
+        } catch {}
       }
+      return { type: "failed", error: "Notion sign-in did not finish within 3 minutes. Sign in on the page, then try again." }
     },
   }
 }
@@ -219,8 +257,13 @@ export function createPlugin(protocol, options = {}) {
   const timeoutMs = options.timeoutMs ?? 300_000
   const browserReadMs = options.browserReadMs ?? 60_000
   const session = options.session ?? localSession
+  const env = options.env ?? process.env
+  const signInPollMs = options.signInPollMs ?? SIGN_IN_POLL_MS
+  const signInTimeoutMs = options.signInTimeoutMs ?? SIGN_IN_TIMEOUT_MS
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 3_600_000) throw new Error("Notion timeoutMs must be between 1000 and 3600000 milliseconds.")
   if (!Number.isSafeInteger(browserReadMs) || browserReadMs < 0) throw new Error("Notion browserReadMs must be zero or more whole milliseconds.")
+  if (!Number.isSafeInteger(signInPollMs) || signInPollMs < 1) throw new Error("Notion signInPollMs must be one or more whole milliseconds.")
+  if (!Number.isSafeInteger(signInTimeoutMs) || signInTimeoutMs < 1) throw new Error("Notion signInTimeoutMs must be one or more whole milliseconds.")
   const reader = browserReader(session, browserReadMs)
   return {
     async config(config) {
@@ -236,7 +279,7 @@ export function createPlugin(protocol, options = {}) {
       provider: ID,
       maxConcurrency: 1,
       methods: [
-        { type: "oauth", label: "Use the Notion session in this browser", authorize: () => browserSignIn(session) },
+        { type: "oauth", label: "Use the Notion session in this browser", authorize: () => browserSignIn(session, { env, pollMs: signInPollMs, timeoutMs: signInTimeoutMs }) },
         {
           type: "api",
           label: "Notion web session (paste the Cookie header)",
