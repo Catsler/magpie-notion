@@ -1,4 +1,4 @@
-# opencode-notion-auth
+# magpie-notion
 
 用你自己的 Notion 网页会话，把工作区里 Notion AI 的模型接到 magpie / OpenCode 上，
 并在 `magpie quota` 里看到订阅额度的使用情况。
