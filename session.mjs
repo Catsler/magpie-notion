@@ -29,6 +29,11 @@ const NAMES = ["token_v2", "notion_user_id", "notion_browser_id", "notion_check_
 // been seen taking half a minute on the socket alone - so the read over a
 // debugging port is given longer than a file that is already there.
 const DEVTOOLS_TIMEOUT = 30_000
+// A container sidecar on another host can be absent or unreachable. Failing to
+// open the socket should be quick; only a socket that did open gets the longer
+// time above to answer.
+const DEVTOOLS_CONNECT_TIMEOUT = 3_000
+const BASIC_STORE_PASSPHRASE = "peanuts"
 // A Chromium user data directory named in the environment is read before the
 // desktop's own browsers: a container has no desktop profile, but an operator
 // can put one where this build can reach it, and then that one is meant. The
@@ -264,7 +269,7 @@ export async function findDevtoolsSession(options = {}) {
     const named = stores.find((other) => other.root === store.root && other.profile === "Default") ?? store
     const where = `${named.browser} (${named.profile})`
     try {
-      const cookies = (await (options.connect ?? connectDevtools)(endpoint, options.devtoolsTimeout ?? DEVTOOLS_TIMEOUT))
+      const cookies = (await (options.connect ?? connectDevtools)(endpoint, options.devtoolsTimeout ?? DEVTOOLS_TIMEOUT, options.devtoolsConnectTimeout ?? DEVTOOLS_CONNECT_TIMEOUT))
         .filter((cookie) => NAMES.includes(cookie?.name) && notionHost(cookie?.domain) && cookie.value)
       const best = bestCookies(cookies)
       if (!best.some((cookie) => cookie.name === "token_v2")) {
@@ -289,12 +294,21 @@ export async function findDevtoolsSession(options = {}) {
 
 // devtoolsEndpoint is the address of the user data directory's DevTools server,
 // which the browser writes down while it runs: the port on one line, the path
-// on the next.
+// on the next. A container sidecar can be on another host, so it may write a
+// DevToolsHost beside the port; without that file the server is local.
 function devtoolsEndpoint(store) {
   try {
     const [port, path] = readFileSync(join(store.root, "DevToolsActivePort"), "utf8").split(/\r?\n/)
     if (!/^\d+$/.test(String(port).trim()) || !String(path ?? "").startsWith("/devtools/")) return undefined
-    return `ws://127.0.0.1:${String(port).trim()}${String(path).trim()}`
+    let host = "127.0.0.1"
+    try {
+      const named = readFileSync(join(store.root, "DevToolsHost"), "utf8").split(/\r?\n/, 1)[0].trim()
+      if (/^[A-Za-z0-9._:[\]-]+$/.test(named)) host = named
+    } catch {
+      // The default local host is the desktop browser's address.
+    }
+    const authority = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host
+    return `ws://${authority}:${String(port).trim()}${String(path).trim()}`
   } catch {
     return undefined
   }
@@ -308,11 +322,11 @@ function devtoolsEndpoint(store) {
 // this port even though the socket opens at once, and an answer that never
 // comes is not a refusal: the read is tried twice before the caller is told,
 // so one slow moment does not read as "not signed in".
-async function connectDevtools(endpoint, timeout) {
+async function connectDevtools(endpoint, timeout, connectTimeout = DEVTOOLS_CONNECT_TIMEOUT) {
   let failure
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      return await askDevtools(endpoint, timeout)
+      return await askDevtools(endpoint, timeout, connectTimeout)
     } catch (error) {
       failure = error
       if (error?.reason !== "devtools-timeout") break
@@ -321,12 +335,13 @@ async function connectDevtools(endpoint, timeout) {
   throw failure
 }
 
-function askDevtools(endpoint, timeout) {
+function askDevtools(endpoint, timeout, connectTimeout) {
   return new Promise((resolve, reject) => {
     if (typeof WebSocket !== "function") return reject(new SessionError("this runtime cannot open a browser's debugging port", "unsupported-runtime"))
     let socket
     try { socket = new WebSocket(endpoint) } catch { return reject(new SessionError("the browser's debugging port could not be opened", "devtools")) }
     let settled = false
+    let timer
     const finish = (value) => {
       if (settled) return
       settled = true
@@ -334,7 +349,11 @@ function askDevtools(endpoint, timeout) {
       socket.close?.()
       value instanceof Error ? reject(value) : resolve(value)
     }
-    const timer = setTimeout(() => finish(new SessionError("the browser's debugging port did not answer", "devtools-timeout")), timeout)
+    const wait = (ms, message) => {
+      clearTimeout(timer)
+      timer = setTimeout(() => finish(new SessionError(message, "devtools-timeout")), ms)
+    }
+    wait(connectTimeout, "the browser's debugging port could not be reached")
     socket.addEventListener("error", () => finish(new SessionError("the browser's debugging port refused the read", "devtools")))
     socket.addEventListener("message", (event) => {
       let message
@@ -343,7 +362,11 @@ function askDevtools(endpoint, timeout) {
       if (message.error) finish(new SessionError(`the browser refused to name its cookies (${message.error.message})`, "devtools"))
       else finish(message.result?.cookies ?? [])
     })
-    socket.addEventListener("open", () => socket.send(JSON.stringify({ id: 1, method: "Storage.getCookies", params: {} })))
+    socket.addEventListener("open", () => {
+      if (settled) return
+      wait(timeout, "the browser's debugging port did not answer")
+      socket.send(JSON.stringify({ id: 1, method: "Storage.getCookies", params: {} }))
+    })
   })
 }
 
@@ -513,8 +536,13 @@ async function valueKey(store, options) {
     return dpapi(raw.subarray(5), run)
   }
   const secret = platform === "darwin" ? await keychainSecret(store, run) : await secretServiceKey(store, run)
-  if (!secret) throw new SessionError("the desktop's keychain did not give up its cookie key", "unsupported-encryption")
-  return { cipher: "cbc", key: pbkdf2Sync(secret, "saltysalt", platform === "darwin" ? 1003 : 1, 16, "sha1") }
+  if (secret) return { cipher: "cbc", key: pbkdf2Sync(secret, "saltysalt", platform === "darwin" ? 1003 : 1, 16, "sha1") }
+  const keychainError = new SessionError("the desktop's keychain did not give up its cookie key", "unsupported-encryption")
+  if (platform !== "linux") throw keychainError
+  // Chromium's basic store uses this fixed passphrase and the same Linux CBC
+  // format. Keep the original reason if it cannot open the value, because the
+  // store may still need the desktop's own sign-in service.
+  return { cipher: "cbc", key: pbkdf2Sync(BASIC_STORE_PASSPHRASE, "saltysalt", 1, 16, "sha1"), fallbackError: keychainError }
 }
 
 async function dpapi(blob, run) {
@@ -575,7 +603,11 @@ export function decryptValue(value, secret, options = {}) {
   if (!secret) throw new SessionError("the store's cookie key is missing", "unsupported-encryption")
   if (prefix === "v10" || prefix === "v11") {
     if (platform === "win32" || secret.cipher === "gcm") return gcm(value.subarray(3), secret.key)
-    return cbc(value.subarray(3), secret.key)
+    try {
+      return cbc(value.subarray(3), secret.key)
+    } catch (error) {
+      throw secret.fallbackError ?? error
+    }
   }
   // Chrome before v80 sealed each value with DPAPI on its own. Those builds
   // are years old; a value that is not marked with a version is reported, not
@@ -624,4 +656,4 @@ function runFile(file, args, options = {}) {
   })
 }
 
-export const _internal = { UUID, HOSTS, NAMES, notionHost, sameRoot, configuredRoots, chromiumRoots, firefoxRoots, readStore, valueKey, devtoolsEndpoint, connectDevtools, gcm, cbc, runFile, toBuffer, all }
+export const _internal = { UUID, HOSTS, NAMES, notionHost, sameRoot, configuredRoots, chromiumRoots, firefoxRoots, readStore, valueKey, devtoolsEndpoint, connectDevtools, BASIC_STORE_PASSPHRASE, gcm, cbc, runFile, toBuffer, all }

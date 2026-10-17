@@ -1,9 +1,7 @@
 import { randomUUID } from "node:crypto"
-import * as localSession from "./session.mjs"
 
 const ID = "notion"
 const VIRTUAL_API = "https://notion.invalid/v1"
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const encoder = new TextEncoder()
 
 export class ProviderError extends Error {
@@ -138,7 +136,6 @@ function scopedSignal(signal, timeoutMs) {
   const controller = new AbortController()
   const abort = () => controller.abort(new ProviderError(499, "request_cancelled", "The client cancelled the Notion AI request."))
   const timer = setTimeout(() => controller.abort(new ProviderError(504, "request_timeout", "The Notion AI request exceeded its total time limit.")), timeoutMs)
-  timer.unref?.()
   if (signal?.aborted) abort()
   else signal?.addEventListener("abort", abort, { once: true })
   return { signal: controller.signal, close: (reason) => {
@@ -148,80 +145,9 @@ function scopedSignal(signal, timeoutMs) {
   } }
 }
 
-// browserSignIn takes the Notion session of the browser this machine is already
-// signed in to, the way the other magpie plugins take the sign-in of the app
-// they belong to. Nothing is asked and nothing is shown: the method resolves on
-// its own, and the workspace is discovered from the session later, so nobody
-// has to paste a UUID.
-async function browserSignIn(session) {
-  return {
-    url: "",
-    instructions: "Reads the Notion session from the Chrome, Edge, Brave, Chromium or Firefox profile on this machine.",
-    method: "auto",
-    callback: async () => {
-      try {
-        const found = await session.findSession()
-        return {
-          type: "success",
-          key: found.cookie,
-          metadata: { browser: found.browser, profile: found.profile, ...(found.via ? { via: found.via } : {}), ...(found.activeUserId ? { activeUserId: found.activeUserId } : {}) },
-        }
-      } catch (error) {
-        return { type: "failed", error: error instanceof Error ? error.message : "The Notion session in this machine's browser could not be read." }
-      }
-    },
-  }
-}
-
-// browserReader is the sign-in a request runs with: a session taken from a
-// browser is read again, since the browser may have signed in again since it was
-// kept. A read that fails keeps the session that was saved rather than failing
-// the request, and the workspace is rediscovered from the session itself.
-//
-// Reading a browser is not free - a store is copied and opened, or a running
-// browser is asked over its debugging port, which can take seconds on a busy
-// machine - so an answer is reused for a while instead of on every request, and
-// a request that came back unauthorized drops it at once: a sign-in that has
-// been renewed in the browser is then picked up on the very next request. The
-// reuse is keyed by the browser profile the sign-in names, and only the fields
-// the browser answers for are taken from it: two accounts on the same machine
-// share one read without sharing each other's workspace.
-export function browserReader(session, windowMs) {
-  let last
-  const identity = (auth) => `${auth.metadata.browser}\u0000${typeof auth.metadata.profile === "string" ? auth.metadata.profile : ""}`
-  const withFound = (auth, found) => ({
-    ...auth,
-    key: found.cookie,
-    metadata: { ...auth.metadata, browser: found.browser, profile: found.profile, ...(found.via ? { via: found.via } : {}), ...(found.activeUserId ? { activeUserId: found.activeUserId } : {}) },
-  })
-  return {
-    async read(auth) {
-      if (typeof auth?.metadata?.browser !== "string") return auth
-      if (last && last.identity === identity(auth) && Date.now() - last.at < windowMs) return withFound(auth, last.found)
-      try {
-        const found = await session.findSession()
-        last = { at: Date.now(), identity: identity(auth), found }
-        return withFound(auth, found)
-      } catch (error) {
-        // The saved session stays the fallback, and the reason the browser could
-        // not be read is kept where a caller can see it instead of vanishing.
-        const message = error instanceof Error ? error.message : "the Notion session in this machine's browser could not be read"
-        return { ...auth, metadata: { ...auth.metadata, lastReadError: message } }
-      }
-    },
-    forget() {
-      last = undefined
-    },
-  }
-}
-
 export function createPlugin(protocol, options = {}) {
   const timeoutMs = options.timeoutMs ?? 300_000
-  const browserReadMs = options.browserReadMs ?? 60_000
-  const session = options.session ?? localSession
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 3_600_000) throw new Error("Notion timeoutMs must be between 1000 and 3600000 milliseconds.")
-  if (!Number.isSafeInteger(browserReadMs) || browserReadMs < 0) throw new Error("Notion browserReadMs must be zero or more whole milliseconds.")
-  const reader = browserReader(session, browserReadMs)
   return {
     async config(config) {
       config.provider ??= {}
@@ -236,15 +162,7 @@ export function createPlugin(protocol, options = {}) {
       provider: ID,
       maxConcurrency: 1,
       methods: [
-        { type: "oauth", label: "Use the Notion session in this browser", authorize: () => browserSignIn(session) },
-        {
-          type: "api",
-          label: "Notion web session (paste the Cookie header)",
-          prompts: [
-            { type: "text", key: "spaceId", message: "Notion workspace id (optional UUID; blank finds it from the session)", placeholder: "(blank)", validate: (value) => !value || UUID.test(value) ? undefined : "Enter the workspace's UUID, or leave blank to find it from the session." },
-            { type: "text", key: "activeUserId", message: "Notion active user UUID (optional; blank for the session default)", placeholder: "(blank)", validate: (value) => !value || UUID.test(value) ? undefined : "Enter a user UUID or leave blank." },
-          ],
-        },
+        { type: "api", label: "粘贴 token_v2", placeholder: "只粘贴 token_v2" },
       ],
       async loader(getAuth) {
         return {
@@ -263,14 +181,13 @@ export function createPlugin(protocol, options = {}) {
               const chat = parseChat(body)
               scope = scopedSignal(request.signal, timeoutMs)
               scope.signal.throwIfAborted()
-              const auth = await reader.read(await getAuth())
+              const auth = await getAuth()
               const events = await protocol.open({ auth, chat, signal: scope.signal })
               if (chat.stream) return streamResponse(completionChunks(events, chat.model, scope.signal), scope.close)
               try { return await bufferedResponse(events, chat.model, scope.signal) } finally { scope.close() }
             } catch (error) {
               if (scope?.signal.aborted && scope.signal.reason instanceof ProviderError) error = scope.signal.reason
               scope?.close()
-              if (error?.status === 401) reader.forget()
               return errorResponse(error)
             }
           },
@@ -281,9 +198,9 @@ export function createPlugin(protocol, options = {}) {
       // response is an error to show, never an empty account.
       async usage(getAuth) {
         try {
-          return await protocol.usage({ auth: await reader.read(await getAuth()) })
+          return await protocol.usage({ auth: await getAuth() })
         } catch {
-          return { error: "The Notion AI quota could not be read.", windows: [] }
+          return { error: "无法读取 Notion AI 额度。", windows: [] }
         }
       },
     },
@@ -296,4 +213,4 @@ export function createPlugin(protocol, options = {}) {
   }
 }
 
-export const _internal = { parseChat, completionChunks, streamResponse, bufferedResponse, publicError, scopedSignal, errorResponse, browserReader }
+export const _internal = { parseChat, completionChunks, streamResponse, bufferedResponse, publicError, scopedSignal, errorResponse }

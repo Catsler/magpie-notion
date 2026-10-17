@@ -4,13 +4,15 @@ import { createCipheriv, pbkdf2Sync, randomBytes } from "node:crypto"
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { delimiter, join } from "node:path"
-import { browserReader, createPlugin } from "../core.mjs"
+import { createPlugin } from "../core.mjs"
 import protocol from "../protocol.mjs"
 import { SessionError, bestCookies, browserStores, cookieHeader, copyToTemporary, decryptValue, findDevtoolsSession, findSession, _internal } from "../session.mjs"
 
 const UUID = "11111111-1111-4111-8111-111111111111"
 const USER = "22222222-2222-4222-8222-222222222222"
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const realFetch = globalThis.fetch
+const cookieValue = (header, name) => header.split(";").map((part) => part.trim()).find((part) => part.startsWith(name + "="))?.slice(name.length + 1)
 
 let sqlite
 try { sqlite = (await import("bun:sqlite")).Database } catch { sqlite = undefined }
@@ -190,6 +192,43 @@ test("the desktop keychain is asked under the name each browser files its key as
   expect(asked[0]).toEqual(["secret-tool", "lookup", "application", "microsoft-edge"])
 })
 
+test("a Linux basic store opens with its fixed passphrase when the sign-in service gives no value", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "magpie-basic-store-"))
+  try {
+    const derived = pbkdf2Sync(_internal.BASIC_STORE_PASSPHRASE, "saltysalt", 1, 16, "sha1")
+    const rows = [
+      { name: "token_v2", encrypted_value: cbcSeal("synthetic-session", derived), host: ".app.notion.com" },
+      { name: "notion_user_id", encrypted_value: cbcSeal(USER, derived), host: ".app.notion.com" },
+    ]
+    const store = { kind: "chromium", browser: "Chromium", profile: "Default", db: join(directory, "Cookies"), localState: join(directory, "Local State") }
+    const found = await findSession({
+      ...temporary,
+      platform: "linux",
+      stores: [store],
+      openDatabase: () => database(rows),
+      run: async () => { throw new Error("no sign-in service") },
+    })
+    expect(found).toEqual({ cookie: `token_v2=synthetic-session; notion_user_id=${USER}`, browser: "Chromium", profile: "Default", activeUserId: USER })
+
+    // A value this passphrase cannot open keeps the original service failure.
+    const cipher = createCipheriv("aes-128-cbc", derived, Buffer.alloc(16, " "))
+    cipher.setAutoPadding(false)
+    const invalid = Buffer.concat([Buffer.from("v10"), cipher.update(Buffer.alloc(16)), cipher.final()])
+    const denied = await captureAsync(() => findSession({
+      ...temporary,
+      platform: "linux",
+      stores: [store],
+      openDatabase: () => database([{ name: "token_v2", encrypted_value: invalid, host: ".app.notion.com" }]),
+      run: async () => "",
+    }))
+    expect(denied).toBeInstanceOf(SessionError)
+    expect(denied.reason).toBe("no-session")
+    expect(denied.message).toContain("keychain did not give up")
+  } finally {
+    remove(directory)
+  }
+})
+
 test("a readStore copy is taken back after it has been read", async () => {
   const directory = mkdtempSync(join(tmpdir(), "magpie-copy-"))
   const before = leftovers().length
@@ -335,8 +374,11 @@ test("a profile that is running names its debugging port, and one that is not na
   try {
     const root = join(home, "Root")
     mkdirSync(root)
-    writeFileSync(join(root, "DevToolsActivePort"), "9222\n/devtools/browser/9aa60052-e2ea-4127-b4cc-84a58e813c97\n")
-    expect(_internal.devtoolsEndpoint({ root })).toBe("ws://127.0.0.1:9222/devtools/browser/9aa60052-e2ea-4127-b4cc-84a58e813c97")
+    writeFileSync(join(root, "DevToolsActivePort"), "9222\n/devtools/browser/devtools-path\n")
+    expect(_internal.devtoolsEndpoint({ root })).toBe("ws://127.0.0.1:9222/devtools/browser/devtools-path")
+    writeFileSync(join(root, "DevToolsHost"), "magpie-notion-browser\n")
+    expect(_internal.devtoolsEndpoint({ root })).toBe("ws://magpie-notion-browser:9222/devtools/browser/devtools-path")
+    rmSync(join(root, "DevToolsHost"))
     writeFileSync(join(root, "DevToolsActivePort"), "not a port\n")
     expect(_internal.devtoolsEndpoint({ root })).toBeUndefined()
     expect(_internal.devtoolsEndpoint({ root: join(home, "Missing") })).toBeUndefined()
@@ -437,34 +479,35 @@ test("a read that times out is tried once more, and a refusal is not", async () 
   }
 })
 
-test("the browser sign-in takes the session that is there, asking nothing", async () => {
-  const session = { findSession: async () => ({ cookie: `token_v2=live-session; notion_user_id=${USER}`, browser: "Edge", profile: "Default", activeUserId: USER }) }
-  const plugin = createPlugin(protocol, { session })
-  const method = plugin.auth.methods.find((entry) => entry.type === "oauth")
-  expect(method.label).toBe("Use the Notion session in this browser")
-  const start = await method.authorize()
-  expect(start).toMatchObject({ url: "", method: "auto" })
-  expect(typeof start.callback).toBe("function")
-  expect(await start.callback()).toEqual({ type: "success", key: `token_v2=live-session; notion_user_id=${USER}`, metadata: { browser: "Edge", profile: "Default", activeUserId: USER } })
+test("a debugging port that never opens has a short connection limit", async () => {
+  const real = globalThis.WebSocket
+  const attempts = []
+  class HangingWebSocket {
+    constructor(endpoint) {
+      this.listeners = {}
+      attempts.push(endpoint)
+    }
+    addEventListener(type, handler) { (this.listeners[type] ??= []).push(handler) }
+    send() {}
+    close() {}
+  }
+  globalThis.WebSocket = HangingWebSocket
+  try {
+    const started = Date.now()
+    const error = await captureAsync(() => _internal.connectDevtools("ws://magpie-notion-browser:9222/devtools/browser/devtools-path", 1_000, 10))
+    expect(error).toBeInstanceOf(SessionError)
+    expect(error.reason).toBe("devtools-timeout")
+    expect(error.message).toContain("could not be reached")
+    expect(attempts).toHaveLength(2)
+    expect(Date.now() - started).toBeLessThan(500)
+  } finally {
+    globalThis.WebSocket = real
+  }
 })
 
-test("a store this build cannot open fails the sign-in with the reason, not a generic error", async () => {
-  const session = { findSession: async () => { throw new SessionError("Chrome (Default): this store's cookies are bound to the browser (v20); paste the Cookie header instead", "unsupported-encryption") } }
-  const plugin = createPlugin(protocol, { session })
-  const result = await (await plugin.auth.methods.find((entry) => entry.type === "oauth").authorize()).callback()
-  expect(result.type).toBe("failed")
-  expect(result.error).toContain("v20")
-  expect(result.error).toContain("paste the Cookie header")
-})
-
-test("the manual method asks for the session only, and a blank workspace is allowed", async () => {
+test("the only sign-in method is a Chinese token_v2 paste field", async () => {
   const plugin = createPlugin(protocol, {})
-  const manual = plugin.auth.methods.find((entry) => entry.type === "api")
-  expect(manual.prompts.filter((prompt) => prompt.key === "spaceId").every((prompt) => prompt.validate("") === undefined)).toBe(true)
-  expect(manual.prompts.find((prompt) => prompt.key === "spaceId").validate("not-a-uuid")).toBeString()
-  expect(manual.prompts.find((prompt) => prompt.key === "activeUserId").validate("")).toBeUndefined()
-  expect(manual.prompts.find((prompt) => prompt.key === "activeUserId").validate("nope")).toBeString()
-  expect(manual.prompts.every((prompt) => prompt.type === "text")).toBe(true)
+  expect(plugin.auth.methods).toEqual([{ type: "api", label: "粘贴 token_v2", placeholder: "只粘贴 token_v2" }])
 })
 
 function mockNotion(handle) {
@@ -488,46 +531,17 @@ async function chat(plugin, auth) {
   return loader.fetch("https://notion.invalid/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: "test-model", stream: true, messages: [{ role: "user", content: "Hello" }] }) })
 }
 
-test("a request reads the browser again, and the saved session is the fallback", async () => {
+test("the pasted token is used directly and never reads a browser", async () => {
   const mock = mockNotion()
-  let reads = 0
-  const session = { findSession: async () => { reads++; return reads === 1 ? { cookie: "token_v2=live-one", browser: "Chrome", profile: "Default" } : (() => { throw new SessionError("Chrome is not running", "locked") })() } }
-  const plugin = createPlugin(protocol, { session, browserReadMs: 0 })
-  const kept = { type: "api", key: "token_v2=kept", metadata: { browser: "Chrome", profile: "Default", spaceId: UUID } }
-  expect((await chat(plugin, kept)).status).toBe(200)
-  expect((await chat(plugin, kept)).status).toBe(200)
-  expect(reads).toBe(2)
-  expect(mock.calls.filter((call) => call.name === "createAgentThread").map((call) => call.init.headers.Cookie)).toEqual(["token_v2=live-one", "token_v2=kept"])
-  globalThis.fetch = realFetch
-})
-
-test("a burst of requests reuses one browser read, and an unauthorized answer drops it", async () => {
-  let reads = 0
-  let expired = false
-  const mock = mockNotion((name) => (name === "createAgentThread" && expired ? Response.json({ message: "session expired" }, { status: 401 }) : undefined))
-  const session = { findSession: async () => { reads++; return { cookie: "token_v2=live", browser: "Chrome", profile: "Default" } } }
-  const plugin = createPlugin(protocol, { session })
-  const kept = { type: "api", key: "token_v2=kept", metadata: { browser: "Chrome", profile: "Default", spaceId: UUID } }
-  expect((await chat(plugin, kept)).status).toBe(200)
-  expect((await chat(plugin, kept)).status).toBe(200)
-  expect(reads).toBe(1)
-  expect(mock.calls.filter((call) => call.name === "createAgentThread").map((call) => call.init.headers.Cookie)).toEqual(["token_v2=live", "token_v2=live"])
-  expired = true
-  expect((await chat(plugin, kept)).status).toBe(401)
-  expect(reads).toBe(1)
-  expired = false
-  expect((await chat(plugin, kept)).status).toBe(200)
-  expect(reads).toBe(2)
-  globalThis.fetch = realFetch
-})
-
-test("a session that was pasted by hand never reads a browser", async () => {
-  const mock = mockNotion()
-  const session = { findSession: async () => { throw new Error("a browser must not be read") } }
-  const plugin = createPlugin(protocol, { session })
-  const auth = { type: "api", key: "token_v2=by-hand", metadata: { spaceId: UUID, activeUserId: USER } }
+  const plugin = createPlugin(protocol, {})
+  const auth = { type: "api", key: "pasted-token-value", metadata: { spaceId: UUID, activeUserId: USER } }
   expect((await chat(plugin, auth)).status).toBe(200)
-  expect(new Set(mock.calls.map((call) => call.init.headers.Cookie))).toEqual(new Set(["token_v2=by-hand"]))
+  const cookies = new Set(mock.calls.map((call) => call.init.headers.Cookie))
+  expect(cookies.size).toBe(1)
+  const header = cookies.values().next().value
+  expect(cookieValue(header, "token_v2")).toBe(auth.key)
+  expect(UUID_PATTERN.test(cookieValue(header, "device_id"))).toBe(true)
+  expect(cookieValue(header, "notion_users")).toBe(encodeURIComponent(JSON.stringify([USER])))
   globalThis.fetch = realFetch
 })
 
@@ -561,35 +575,6 @@ test.skipIf(!sqlite || process.platform !== "win32")("a v20 store is reported wi
   } finally {
     remove(directory)
   }
-})
-
-test("reusing one browser read does not mix up the accounts that share it", async () => {
-  const mock = mockNotion()
-  const other = "33333333-3333-4333-8333-333333333333"
-  let reads = 0
-  const session = { findSession: async () => { reads++; return { cookie: "token_v2=live", browser: "Chrome", profile: "Default" } } }
-  const plugin = createPlugin(protocol, { session })
-  const first = { type: "api", key: "token_v2=kept", metadata: { browser: "Chrome", profile: "Default", spaceId: UUID } }
-  const second = { type: "api", key: "token_v2=kept", metadata: { browser: "Chrome", profile: "Default", spaceId: other } }
-  expect((await chat(plugin, first)).status).toBe(200)
-  expect((await chat(plugin, second)).status).toBe(200)
-  expect(reads).toBe(1)
-  // One read is shared, but each request still runs in the workspace its own
-  // sign-in names.
-  const created = mock.calls.filter((call) => call.name === "createAgentThread")
-  expect(created.map((call) => call.data.spaceId)).toEqual([UUID, other])
-  expect(created.every((call) => call.init.headers.Cookie === "token_v2=live")).toBe(true)
-  globalThis.fetch = realFetch
-})
-
-test("a browser read that fails keeps the saved session and the reason it failed", async () => {
-  const session = { findSession: async () => { throw new SessionError("Chrome is running and holds its cookie store open; close Chrome and sign in again", "locked") } }
-  const reader = browserReader(session, 60_000)
-  const kept = { type: "api", key: "token_v2=kept", metadata: { browser: "Chrome", profile: "Default", spaceId: UUID } }
-  const read = await reader.read(kept)
-  expect(read.key).toBe("token_v2=kept")
-  expect(read.metadata.spaceId).toBe(UUID)
-  expect(read.metadata.lastReadError).toContain("close Chrome")
 })
 
 test("a runtime without WebSocket says so instead of blaming the encryption", async () => {

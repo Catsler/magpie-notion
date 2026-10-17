@@ -8,7 +8,8 @@ import { NotionPlugin } from "../index.mjs"
 const originalFetch = globalThis.fetch
 const uuid = "11111111-1111-4111-8111-111111111111"
 const user = "22222222-2222-4222-8222-222222222222"
-const auth = { type: "api", key: "test_session=not-a-real-cookie", metadata: { spaceId: uuid } }
+const token = "offline-token-v2"
+const auth = { type: "api", key: token, metadata: { spaceId: uuid } }
 const model = { model: "test-model", modelMessage: "Offline test", agentService: {}, modelConfiguration: { supportedReasoningEfforts: ["low", "high"], defaultReasoningEffort: "low" } }
 const chat = (messages = [{ role: "user", content: "First" }], more = {}) => ({ model: model.model, messages, ...more })
 const message = (text, sequence = 1, id = "assistant") => ({ op: "put", entity: { id, kind: "assistant_message", sequence, content: [{ type: "text", text }] } })
@@ -18,6 +19,7 @@ const page = (patches = [], sequence = 0, status = "running") => ({ type: "agent
 const collect = async (iterable) => { const out = []; for await (const item of iterable) out.push(item); return out }
 const iterable = async function* (values) { yield* values }
 const ndjson = (frames) => new Response(frames.map((v) => JSON.stringify(v)).join("\n") + "\n")
+const cookieValue = (header, name) => header.split(";").map((part) => part.trim()).find((part) => part.startsWith(name + "="))?.slice(name.length + 1)
 
 function mockNotion(options = {}) {
   const calls = []
@@ -141,7 +143,7 @@ test.each(["cookie", "workspace", "active-user", "model-effort", "history"])("hi
   const history = await firstTurn()
   let nextAuth = structuredClone(auth)
   const extra = {}
-  if (dimension === "cookie") nextAuth.key = "other-test-session"
+  if (dimension === "cookie") nextAuth.key = "other-" + token
   if (dimension === "workspace") nextAuth.metadata.spaceId = user
   if (dimension === "active-user") nextAuth.metadata.activeUserId = user
   if (dimension === "model-effort") extra.reasoning_effort = "high"
@@ -254,25 +256,46 @@ test("catalog outage cannot be replaced by a static model", async () => {
   expect((await request(chat(undefined, { model: "omniberry-sundae" }))).status).toBe(503)
 })
 
-test("invalid auth and UUID metadata fail before any network request", async () => {
+test("a raw token and a pasted Cookie both keep only token_v2", () => {
+  expect(internals.credentials({ type: "api", key: token })).toMatchObject({ cookie: `token_v2=${token}` })
+  expect(internals.credentials({ type: "api", key: `Cookie: token_v2=${token}; notion_user_id=ignored` })).toMatchObject({ cookie: `token_v2=${token}` })
+})
+
+test("invalid pasted tokens and UUID metadata fail before any network request", async () => {
   const mock = mockNotion()
-  // A workspace that is absent is not an error: it is discovered from the
-  // session (test/workspace.test.mjs). A workspace that is not a UUID still is.
-  for (const invalidAuth of [{ type: "api", key: "x\r\ny", metadata: { spaceId: uuid } }, { type: "api", key: "  ", metadata: {} }, { ...auth, metadata: { spaceId: uuid, activeUserId: "invalid" } }, { ...auth, metadata: { spaceId: "not-a-uuid" } }]) {
-    expect((await request(chat(), { auth: invalidAuth })).status).toBeGreaterThanOrEqual(400)
+  for (const invalidAuth of [
+    { type: "api", key: "x\r\ny", metadata: { spaceId: uuid } },
+    { type: "api", key: "  ", metadata: {} },
+    { type: "api", key: "token_v2=", metadata: {} },
+    { type: "api", key: "notion_user_id=no-token-here", metadata: {} },
+  ]) {
+    const response = await request(chat(), { auth: invalidAuth })
+    expect(response.status).toBe(401)
+    expect(await response.text()).toContain("请粘贴 Notion 的 token_v2。")
   }
+  const pasted = "private-pasted-token\r\nmust-not-leak"
+  const leaked = await request(chat(), { auth: { type: "api", key: pasted, metadata: {} } })
+  const leakedBody = await leaked.text()
+  expect(leaked.status).toBe(401)
+  expect(leakedBody).toContain("请粘贴 Notion 的 token_v2。")
+  expect(leakedBody).not.toContain("private-pasted-token")
+  expect((await request(chat(), { auth: { ...auth, metadata: { spaceId: uuid, activeUserId: "invalid" } } })).status).toBe(400)
+  expect((await request(chat(), { auth: { ...auth, metadata: { spaceId: "not-a-uuid" } } })).status).toBe(400)
   expect(mock.calls).toHaveLength(0)
 })
 
 test("incoming credentials are not forwarded, and safe agent settings are present", async () => {
   const mock = mockNotion()
-  await request(chat(), { auth: { ...auth, metadata: { ...auth.metadata, activeUserId: user } } })
+  const pasted = `token_v2=${token}; notion_user_id=unrelated-cookie`
+  await request(chat(), { auth: { ...auth, key: pasted, metadata: { ...auth.metadata, activeUserId: user } } })
   expect(mock.calls.every((v) => v.url.startsWith("https://app.notion.com/api/v3/"))).toBe(true)
   for (const call of mock.calls) {
     expect(call.init.headers.Authorization).toBeUndefined()
-    expect(call.init.headers.Cookie).toBe(auth.key)
+    expect(cookieValue(call.init.headers.Cookie, "token_v2")).toBe(token)
+    expect(call.init.headers.Cookie).toContain("notion_users=" + encodeURIComponent(JSON.stringify([user])))
     expect(call.init.headers["x-notion-active-user-header"]).toBe(user)
     expect(call.init.redirect).toBe("error")
+    expect(call.init.headers.Cookie).not.toContain("unrelated-cookie")
   }
   expect(mock.calls.find((v) => v.name === "createAgentThread").data).toMatchObject({ policies: { approval_mode: "ask", disable_internet_access: true, disable_computer_file_downloads: true }, agentMemorySettings: { useMemories: false, excludeChatFromMemories: true }, browserEnabled: false })
 })
@@ -285,8 +308,12 @@ test.each([{ tools: [{ type: "function" }] }, { messages: [{ role: "tool", conte
 
 test("package entry exports only the plugin and all declared runtime files exist", async () => {
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url)))
+  const plugin = await NotionPlugin()
   expect(Object.keys(await import("../index.mjs"))).toEqual(["NotionPlugin"])
-  expect((await NotionPlugin()).auth.provider).toBe("notion")
+  expect(pkg).toMatchObject({ name: "magpie-notion", version: "0.2.4" })
+  expect(pkg.description).toContain("token_v2")
+  expect(plugin.auth.provider).toBe("notion")
+  expect(plugin.auth.methods).toEqual([{ type: "api", label: "粘贴 token_v2", placeholder: "只粘贴 token_v2" }])
   for (const file of pkg.files) expect(existsSync(new URL("../" + file, import.meta.url))).toBe(true)
   expect(pkg.files).not.toContain("independent.test.mjs")
   // standalone repository: it ships as a public npm package with a magpie icon

@@ -6,7 +6,7 @@ const SPACE = "231546b1-eb2d-8176-a5ab-00035eb5210c"
 const OTHER = "e86cfd18-5a19-4b6c-9a71-0c9f9e6d1b42"
 const USER = "22222222-2222-4222-8222-222222222222"
 const THREAD = "33333333-3333-4333-8333-333333333333"
-// A sign-in that states no workspace: exactly what the browser sign-in saves.
+// A sign-in that states no workspace: the workspace is discovered from token_v2.
 const auth = { type: "api", key: "token_v2=offline-session" }
 const model = { model: "test-model", modelMessage: "Test", agentService: {}, modelConfiguration: { supportedReasoningEfforts: ["low"] } }
 const chat = { model: model.model, messages: [{ role: "user", content: "Hello" }] }
@@ -15,6 +15,7 @@ const frame = (...patches) => ({ type: "agent_service_transcript_delta", patches
 const answer = (sequence) => ({ op: "put", entity: { id: "assistant", kind: "assistant_message", sequence, content: [{ type: "text", text: "Answer" }] } })
 const completed = (sequence) => ({ op: "put", entity: { id: "done", kind: "turn_completed", sequence, stop_reason: "end_turn" } })
 const ndjson = (frames) => new Response(frames.map((value) => JSON.stringify(value)).join("\n") + "\n")
+const cookieValue = (header, name) => header.split(";").map((part) => part.trim()).find((part) => part.startsWith(name + "="))?.slice(name.length + 1)
 const realFetch = globalThis.fetch
 
 function mockNotion(options = {}) {
@@ -95,6 +96,108 @@ test("the user the session names is sent as the active user", async () => {
   const mock = mockNotion()
   await asked(AbortSignal.timeout(5_000))
   expect(mock.calls.filter((call) => call.name !== "getSpaces").every((call) => call.headers["x-notion-active-user-header"] === USER)).toBe(true)
+})
+
+test("the create request uses Chrome web headers and a normalized Cookie", async () => {
+  const mock = mockNotion()
+  const stated = { type: "api", key: "token_v2={{SECRET_k3t7vnyw}}; notion_user_id=" + USER, metadata: { activeUserId: USER } }
+  for await (const event of await protocol.open({ auth: stated, chat, signal: AbortSignal.timeout(5_000) })) void event
+  const created = mock.calls.find((call) => call.name === "createAgentThread")
+  const listen = mock.calls.find((call) => call.name === "listenToThreadTranscript")
+  // The replaced fetch observes creation too; impit is not imported in tests.
+  expect(mock.names().filter((name) => name === "createAgentThread")).toHaveLength(1)
+  expect(created.headers.Accept).toBe("application/json")
+  expect(listen.headers.Accept).toBe("application/x-ndjson")
+  expect(created.headers["notion-audit-log-platform"]).toBe("web")
+  expect(created.headers["Sec-Fetch-Site"]).toBe("same-origin")
+  expect(cookieValue(created.headers.Cookie, "token_v2")).toBe("{{SECRET_k3t7vnyw}}")
+  expect(cookieValue(created.headers.Cookie, "device_id")).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
+  expect(cookieValue(created.headers.Cookie, "notion_users")).toBe(encodeURIComponent(JSON.stringify([USER])))
+  expect(new Set(mock.calls.map((call) => cookieValue(call.headers.Cookie, "device_id"))).size).toBe(1)
+})
+
+test("a workspace is never paired with a user from another getSpaces entry", async () => {
+  const other = "44444444-4444-4444-8444-444444444444"
+  // The first entry is another signed-in user; the workspace that answers the
+  // catalog belongs to the second entry's user.
+  const mock = mockNotion({
+    spaces: {
+      [other]: { notion_user: { [other]: {} }, space: { [OTHER]: {} } },
+      [USER]: { notion_user: { [USER]: {} }, space: { [SPACE]: {} } },
+    },
+    answerable: [SPACE],
+  })
+  await asked(AbortSignal.timeout(5_000))
+  const created = mock.calls.find((call) => call.name === "createAgentThread")
+  expect(created.data.spaceId).toBe(SPACE)
+  expect(created.headers["x-notion-active-user-header"]).toBe(USER)
+  // Each catalog probe names the user of the entry that lists the workspace it
+  // asks about, never a user taken from another entry.
+  const probes = mock.calls.filter((call) => call.name === "getAvailableModels")
+  expect(probes.find((call) => call.data.spaceId === OTHER).headers["x-notion-active-user-header"]).toBe(other)
+  expect(probes.find((call) => call.data.spaceId === SPACE).headers["x-notion-active-user-header"]).toBe(USER)
+})
+
+test("the user of a workspace is the entry's own user, not another member listed beside it", async () => {
+  const member = "44444444-4444-4444-8444-444444444444"
+  // The entry belongs to USER and lists a second member in notion_user; the
+  // entry key, not the table's first entry, is the account that owns it.
+  const mock = mockNotion({
+    spaces: { [USER]: { notion_user: { [member]: {}, [USER]: {} }, space: { [SPACE]: {} } } },
+  })
+  await asked(AbortSignal.timeout(5_000))
+  const created = mock.calls.find((call) => call.name === "createAgentThread")
+  expect(created.data.spaceId).toBe(SPACE)
+  expect(created.headers["x-notion-active-user-header"]).toBe(USER)
+})
+
+test("a non-UUID entry with exactly one listed user uses that user", async () => {
+  const owner = "44444444-4444-4444-8444-444444444444"
+  const mock = mockNotion({
+    spaces: { "legacy-entry": { notion_user: { [owner]: {} }, space: { [SPACE]: {} } } },
+  })
+  await asked(AbortSignal.timeout(5_000))
+  const created = mock.calls.find((call) => call.name === "createAgentThread")
+  expect(created.data.spaceId).toBe(SPACE)
+  expect(created.headers["x-notion-active-user-header"]).toBe(owner)
+})
+
+test("a non-UUID entry with several listed users does not guess", async () => {
+  const first = "44444444-4444-4444-8444-444444444444"
+  const second = "55555555-5555-4555-8555-555555555555"
+  const mock = mockNotion({
+    spaces: { "legacy-entry": { notion_user: { [first]: {}, [second]: {} }, space: { [SPACE]: {} } } },
+  })
+  await asked(AbortSignal.timeout(5_000))
+  const created = mock.calls.find((call) => call.name === "createAgentThread")
+  expect(created.data.spaceId).toBe(SPACE)
+  expect(created.headers["x-notion-active-user-header"]).toBeUndefined()
+  const probes = mock.calls.filter((call) => call.name === "getAvailableModels")
+  expect(probes.every((call) => call.headers["x-notion-active-user-header"] === undefined)).toBe(true)
+})
+
+test("a user the sign-in states is sent as stated", async () => {
+  const entryUser = "44444444-4444-4444-8444-444444444444"
+  const mock = mockNotion({ spaces: { [entryUser]: { notion_user: { [entryUser]: {} }, space: { [SPACE]: {} } } } })
+  const stated = { type: "api", key: auth.key, metadata: { activeUserId: USER } }
+  for await (const event of await protocol.open({ auth: stated, chat, signal: AbortSignal.timeout(5_000) })) void event
+  const created = mock.calls.find((call) => call.name === "createAgentThread")
+  expect(created.data.spaceId).toBe(SPACE)
+  expect(created.headers["x-notion-active-user-header"]).toBe(USER)
+})
+
+test("a cached workspace is kept apart by the user it was resolved for", async () => {
+  const other = "44444444-4444-4444-8444-444444444444"
+  const mock = mockNotion({
+    spaces: { [USER]: { notion_user: { [USER]: {} }, space: { [SPACE]: {} } } },
+  })
+  await asked(AbortSignal.timeout(5_000))
+  for await (const event of await protocol.open({ auth: { type: "api", key: auth.key, metadata: { activeUserId: other } }, chat, signal: AbortSignal.timeout(5_000) })) void event
+  // The second request states another user, so the first answer cannot be
+  // reused: it was resolved for a different active user.
+  expect(mock.names().filter((name) => name === "getSpaces")).toHaveLength(2)
+  expect(mock.calls.filter((call) => call.name === "createAgentThread").at(-1).headers["x-notion-active-user-header"]).toBe(other)
+  expect(internals.resolved.size).toBe(2)
 })
 
 test("a workspace the account states is used as is, without asking Notion which one", async () => {

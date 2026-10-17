@@ -8,12 +8,104 @@ const sessions = new Map()
 const catalogs = new Map()
 const TTL = 30 * 60 * 1000
 const digest = (value) => createHash("sha256").update(JSON.stringify(value)).digest("hex")
+const moduleFetch = globalThis.fetch
+let impitClient
+let impitLoading
 
-function cookie(auth) {
-  if (auth?.type !== "api" || typeof auth.key !== "string" || !auth.key.trim() || /[\r\n]/.test(auth.key)) {
-    throw new ProviderError(401, "session_required", "Sign in with the Notion web session's Cookie header.")
+// A stable UUID for Notion's device cookie. The session token selects it, so
+// repeated requests look like one browser without writing a new identifier
+// back into the saved sign-in.
+function deviceId(token) {
+  const bytes = createHash("sha256").update(token).digest().subarray(0, 16)
+  bytes[6] = (bytes[6] & 0x0f) | 0x40
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+  const hex = bytes.toString("hex")
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
+function cookieFields(header) {
+  return header.split(";").map((part) => part.trim()).filter(Boolean).map((part) => {
+    const separator = part.indexOf("=")
+    if (separator < 1) return { name: part, value: undefined }
+    return { name: part.slice(0, separator).trim(), value: part.slice(separator + 1) }
+  })
+}
+
+function hasUser(value, activeUserId) {
+  if (typeof value !== "string" || !value) return false
+  try {
+    return decodeURIComponent(value).includes(activeUserId)
+  } catch {
+    return value.includes(activeUserId)
   }
-  return auth.key.trim()
+}
+
+// The web client sends a device cookie and a notion_users cookie naming the
+// active account. Derive the former from token_v2 and add the latter when the
+// sign-in names a user, keeping every other cookie exactly as supplied.
+function normalizeCookie(header, activeUserId) {
+  const fields = cookieFields(header)
+  if (!fields.some((field) => field.name === "device_id")) {
+    const token = fields.find((field) => field.name === "token_v2")?.value
+    if (token !== undefined && token !== "") fields.push({ name: "device_id", value: deviceId(token) })
+  }
+  if (activeUserId && !fields.some((field) => field.name === "notion_users" && hasUser(field.value, activeUserId))) {
+    const encoded = encodeURIComponent(JSON.stringify([activeUserId]))
+    const existing = fields.find((field) => field.name === "notion_users")
+    if (existing) existing.value = encoded
+    else fields.push({ name: "notion_users", value: encoded })
+  }
+  return fields.map((field) => field.value === undefined ? field.name : `${field.name}=${field.value}`).join("; ")
+}
+
+async function impit() {
+  if (impitClient) return impitClient
+  if (!impitLoading) {
+    impitLoading = import("impit")
+      .then(({ Impit }) => (impitClient = new Impit({ browser: "chrome", followRedirects: false })))
+      .catch(() => {
+        impitLoading = undefined
+        throw new ProviderError(503, "transport_unavailable", "Reinstall the plugin so Magpie can install its impit dependency.")
+      })
+  }
+  return impitLoading
+}
+
+async function request(name, url, init) {
+  // Only thread creation needs Chrome's browser fingerprint. Tests replace the
+  // global fetch after this module loads, so the mock also observes creation
+  // and the suite never imports impit's native dependency.
+  if (name !== "createAgentThread" || globalThis.fetch !== moduleFetch) return globalThis.fetch(url, init)
+  const client = await impit()
+  try {
+    return await client.fetch(url, init)
+  } catch (error) {
+    // Some impit builds reject the request-level redirect option. The shared
+    // client still refuses to follow redirects, so omitting it is safe: a 3xx
+    // response reaches call() and becomes an error there.
+    if (!/redirect/i.test(String(error?.message ?? ""))) throw error
+    const { redirect, ...withoutRedirect } = init
+    return client.fetch(url, withoutRedirect)
+  }
+}
+
+// Accept either the token value by itself or a Cookie header the user pasted by
+// mistake. Only token_v2 is kept, so unrelated pasted cookies never reach the
+// upstream request.
+function cookie(auth) {
+  const reject = () => new ProviderError(401, "session_required", "请粘贴 Notion 的 token_v2。")
+  if (auth?.type !== "api" || typeof auth.key !== "string" || /[\r\n]/.test(auth.key)) throw reject()
+  const pasted = auth.key.trim().replace(/^Cookie\s*:\s*/i, "")
+  if (!pasted) throw reject()
+  const field = cookieFields(pasted).find((entry) => entry.name === "token_v2")
+  if (field) {
+    const token = field.value?.trim()
+    if (!token) throw reject()
+    return `token_v2=${token}`
+  }
+  // A Cookie header without token_v2 is not a token, even when it has one field.
+  if (pasted.includes("=") || pasted.includes(";")) throw reject()
+  return `token_v2=${pasted}`
 }
 
 // A field the sign-in left blank is not a value: an unanswered optional prompt
@@ -25,10 +117,9 @@ function optional(value) {
   return value
 }
 
-// credentials reads what the sign-in states: the Cookie header, and the
-// workspace and user where the account carries them. The workspace is not
-// required: an account without one has it resolved from the session itself, so
-// nobody has to type a UUID.
+// credentials reads the pasted token and the workspace/user metadata where the
+// account carries them. The workspace is not required: an account without one
+// has it resolved from the session itself, so nobody has to type a UUID.
 function credentials(auth) {
   const key = cookie(auth)
   const metadata = auth?.metadata ?? {}
@@ -40,10 +131,19 @@ function credentials(auth) {
 }
 
 async function call(name, data, account, signal) {
-  const headers = { "Content-Type": "application/json", Cookie: account.cookie, Origin: ORIGIN }
+  const headers = {
+    Accept: name === "listenToThreadTranscript" ? "application/x-ndjson" : "application/json",
+    "Content-Type": "application/json",
+    Cookie: normalizeCookie(account.cookie, account.activeUserId),
+    Origin: ORIGIN,
+    "notion-audit-log-platform": "web",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+  }
   if (account.spaceId) headers["x-notion-space-id"] = account.spaceId
   if (account.activeUserId) headers["x-notion-active-user-header"] = account.activeUserId
-  const response = await fetch(`${ORIGIN}/api/v3/${name}`, {
+  const response = await request(name, `${ORIGIN}/api/v3/${name}`, {
     method: "POST",
     headers,
     body: JSON.stringify(data), signal, redirect: "error",
@@ -63,22 +163,38 @@ const RESOLVED_TTL = 30 * 60 * 1000
 // names the ones the user belongs to, and the one that answers the model
 // catalog is the account's. The answer is kept, so the question is asked once
 // per session instead of on every request.
+//
+// One entry of getSpaces belongs to one user and lists that user's workspaces,
+// so the entry's own key is the user those workspaces belong to. The
+// notion_user table beside it can name other members of the same workspaces,
+// and taking the first user named anywhere in the reply would send
+// x-notion-active-user-header naming someone who is not the account.
 async function workspace(read, signal) {
-  const key = digest(read.cookie)
+  const key = digest([read.cookie, read.activeUserId])
   const cached = resolved.get(key)
   if (cached && Date.now() - cached.at < RESOLVED_TTL) return cached
-  const body = await json("getSpaces", {}, { cookie: read.cookie }, signal)
+  const body = await json("getSpaces", {}, { cookie: read.cookie, activeUserId: read.activeUserId }, signal)
+  const owners = new Map()
   const candidates = []
-  let activeUserId
-  for (const entry of Object.values(body ?? {})) {
+  for (const [entryKey, entry] of Object.entries(body ?? {})) {
     if (!entry || typeof entry !== "object") continue
-    for (const spaceId of Object.keys(entry.space ?? {})) if (UUID.test(spaceId) && !candidates.includes(spaceId)) candidates.push(spaceId)
-    for (const id of Object.keys(entry.notion_user ?? {})) if (UUID.test(id) && !activeUserId) activeUserId = id
+    const users = Object.keys(entry.notion_user ?? {}).filter((id) => UUID.test(id))
+    // The entry's key names its user; only an entry with exactly one listed
+    // user can stand in for it, because with several there is no telling which
+    // one the session is.
+    const owner = UUID.test(entryKey) ? entryKey : users.length === 1 ? users[0] : undefined
+    for (const spaceId of Object.keys(entry.space ?? {})) {
+      if (!UUID.test(spaceId) || owners.has(spaceId)) continue
+      owners.set(spaceId, owner)
+      candidates.push(spaceId)
+    }
   }
   if (!candidates.length) throw new ProviderError(404, "workspace_not_found", "This Notion session belongs to no workspace the AI can be asked in.")
-  const user = read.activeUserId ?? activeUserId
   let last
   for (const spaceId of candidates) {
+    // A user the sign-in states is the account it meant; otherwise the entry
+    // that lists this workspace names the user it belongs to.
+    const user = read.activeUserId ?? owners.get(spaceId)
     const answer = { cookie: read.cookie, spaceId, activeUserId: user }
     try {
       const probe = await call("getAvailableModels", { spaceId }, answer, signal)
