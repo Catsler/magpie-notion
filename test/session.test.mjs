@@ -183,7 +183,11 @@ test("the desktop keychain is asked under the name each browser files its key as
   const run = async (file, args) => { asked.push([file, ...args]); return "offline-key" }
   const mac = await _internal.valueKey({ browser: "Edge", localState: "unused" }, { platform: "darwin", run })
   expect(mac).toMatchObject({ cipher: "cbc" })
-  expect(asked[0]).toEqual(["/usr/bin/security", "find-generic-password", "-w", "Microsoft Edge Safe Storage"])
+  // The service name is the value of -s. security reads a bare argument as the
+  // name of a keychain to search, so dropping the -s asks for a keychain called
+  // "Microsoft Edge Safe Storage" and reports the key missing on a machine that
+  // has it. This assertion is what caught that, so it pins the flag.
+  expect(asked[0]).toEqual(["/usr/bin/security", "find-generic-password", "-w", "-s", "Microsoft Edge Safe Storage"])
   asked.length = 0
   const linux = await _internal.valueKey({ browser: "Edge", localState: "unused" }, { platform: "linux", run })
   expect(linux).toMatchObject({ cipher: "cbc" })
