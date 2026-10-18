@@ -4,7 +4,7 @@ import { createCipheriv, createHash, pbkdf2Sync, randomBytes } from "node:crypto
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { delimiter, join } from "node:path"
-import { createPlugin } from "../core.mjs"
+import { browserReader, createPlugin } from "../core.mjs"
 import protocol from "../protocol.mjs"
 import { SessionError, bestCookies, browserStores, cookieHeader, copyToTemporary, decryptValue, findDevtoolsSession, findSession, _internal } from "../session.mjs"
 
@@ -352,9 +352,15 @@ test("a locked store is reported in the words a user can act on", () => {
   expect(error).toBeInstanceOf(SessionError)
   expect(error.reason).toBe("locked")
   expect(error.message).toContain("close Chrome")
+  // Windows reports a store its browser holds open as EPERM/EACCES too, and
+  // closing the browser is the fix there. macOS reports the same errno for a
+  // permission it is withholding, which no browser has to be running for; that
+  // side is pinned by "macOS's refusal to read a browser is told apart from a
+  // locked store" below.
   for (const code of ["EPERM", "EACCES"]) {
-    const denied = capture(() => copyToTemporary({ browser: "Edge", db: "x" }, { copyFile: () => { const failure = new Error("denied"); failure.code = code; throw failure } }))
+    const denied = capture(() => copyToTemporary({ browser: "Edge", db: "x" }, { copyFile: () => { const failure = new Error("denied"); failure.code = code; throw failure }, platform: "win32" }))
     expect(denied.reason).toBe("locked")
+    expect(denied.message).toContain("close Edge")
   }
 })
 
@@ -544,9 +550,136 @@ test("a debugging port that never opens has a short connection limit", async () 
   }
 })
 
-test("the only sign-in method is a Chinese token_v2 paste field", async () => {
+test("the sign-in offers the session in this browser, and the token_v2 paste beside it", async () => {
   const plugin = createPlugin(protocol, {})
-  expect(plugin.auth.methods).toEqual([{ type: "api", label: "粘贴 token_v2", placeholder: "只粘贴 token_v2" }])
+  const [browser, manual] = plugin.auth.methods
+  // Reading a browser is not always possible - macOS denies an app the data
+  // directory until it is given Full Disk Access, and a keychain may refuse the
+  // cookie key - so the paste is what is left when the read cannot be made. It
+  // is offered beside the read rather than instead of it.
+  expect(browser.type).toBe("oauth")
+  expect(typeof browser.authorize).toBe("function")
+  expect(manual).toEqual({ type: "api", label: "粘贴 token_v2", placeholder: "只粘贴 token_v2" })
+})
+
+test("macOS's refusal to read a browser is told apart from a locked store", () => {
+  for (const code of ["EPERM", "EACCES"]) {
+    const denied = capture(() => copyToTemporary({ browser: "Chrome", db: "x" }, { copyFile: () => { const failure = new Error("Operation not permitted"); failure.code = code; throw failure }, platform: "darwin" }))
+    expect(denied).toBeInstanceOf(SessionError)
+    expect(denied.reason).toBe("permission")
+    expect(denied.message).toContain("Full Disk Access")
+    expect(denied.message).not.toContain("close Chrome")
+  }
+  // A failure that is neither is still reported as itself, on every platform.
+  for (const platform of ["darwin", "win32"]) {
+    expect(capture(() => copyToTemporary({ browser: "Chrome", db: "x" }, { copyFile: () => { const failure = new Error("nope"); failure.code = "EIO"; throw failure }, platform })).reason).toBe("unreadable")
+  }
+})
+
+test("the browser sign-in opens the sign-in page and takes the session that is there", async () => {
+  const session = { findSession: async () => ({ cookie: `token_v2=live-session; notion_user_id=${USER}`, browser: "Edge", profile: "Default", activeUserId: USER }) }
+  const plugin = createPlugin(protocol, { session })
+  const method = plugin.auth.methods.find((entry) => entry.type === "oauth")
+  const start = await method.authorize()
+  // The page is what the host has to open: an empty url leaves a sign-in that
+  // cannot be made when the read is refused, with nothing for the user to do.
+  expect(start.url).toBe("https://www.notion.so/login")
+  expect(start.method).toBe("auto")
+  expect(typeof start.callback).toBe("function")
+  expect(await start.callback()).toEqual({ type: "success", key: `token_v2=live-session; notion_user_id=${USER}`, metadata: { browser: "Edge", profile: "Default", activeUserId: USER } })
+})
+
+test("a refused read names its own fix, and every other failure names the way out", async () => {
+  const refusing = createPlugin(protocol, { session: { findSession: async () => { throw new SessionError("macOS does not let this app read Chrome's data; give magpie Full Disk Access …", "permission") } } })
+  const denied = await (await refusing.auth.methods.find((entry) => entry.type === "oauth").authorize()).callback()
+  expect(denied.type).toBe("failed")
+  expect(denied.error).toContain("Full Disk Access")
+  const missing = createPlugin(protocol, { session: { findSession: async () => { throw new SessionError("Chrome (Default) has no Notion session", "no-session") } } })
+  const absent = await (await missing.auth.methods.find((entry) => entry.type === "oauth").authorize()).callback()
+  expect(absent.type).toBe("failed")
+  expect(absent.error).toContain("has no Notion session")
+  expect(absent.error).toContain("粘贴 token_v2")
+})
+
+test("a store this build cannot open fails the sign-in with the reason, not a generic error", async () => {
+  const session = { findSession: async () => { throw new SessionError("Chrome (Default): this store's cookies are bound to the browser (v20); paste the Cookie header instead", "unsupported-encryption") } }
+  const plugin = createPlugin(protocol, { session })
+  const result = await (await plugin.auth.methods.find((entry) => entry.type === "oauth").authorize()).callback()
+  expect(result.type).toBe("failed")
+  expect(result.error).toContain("v20")
+  expect(result.error).toContain("paste the Cookie header")
+})
+
+test("a request reads the browser again, and the saved session is the fallback", async () => {
+  const mock = mockNotion()
+  let reads = 0
+  const session = { findSession: async () => { reads++; return reads === 1 ? { cookie: "token_v2=live-one", browser: "Chrome", profile: "Default" } : (() => { throw new SessionError("Chrome is not running", "locked") })() } }
+  const plugin = createPlugin(protocol, { session, browserReadMs: 0 })
+  const kept = { type: "api", key: "token_v2=kept", metadata: { browser: "Chrome", profile: "Default", spaceId: UUID } }
+  expect((await chat(plugin, kept)).status).toBe(200)
+  expect((await chat(plugin, kept)).status).toBe(200)
+  expect(reads).toBe(2)
+  expect(mock.calls.filter((call) => call.name === "createAgentThread").map((call) => cookieValue(call.init.headers.Cookie, "token_v2"))).toEqual(["live-one", "kept"])
+  globalThis.fetch = realFetch
+})
+
+test("a burst of requests reuses one browser read, and an unauthorized answer drops it", async () => {
+  let reads = 0
+  let expired = false
+  const mock = mockNotion((name) => (name === "createAgentThread" && expired ? Response.json({ message: "session expired" }, { status: 401 }) : undefined))
+  const session = { findSession: async () => { reads++; return { cookie: "token_v2=live", browser: "Chrome", profile: "Default" } } }
+  const plugin = createPlugin(protocol, { session })
+  const kept = { type: "api", key: "token_v2=kept", metadata: { browser: "Chrome", profile: "Default", spaceId: UUID } }
+  expect((await chat(plugin, kept)).status).toBe(200)
+  expect((await chat(plugin, kept)).status).toBe(200)
+  expect(reads).toBe(1)
+  expect(mock.calls.filter((call) => call.name === "createAgentThread").map((call) => cookieValue(call.init.headers.Cookie, "token_v2"))).toEqual(["live", "live"])
+  expired = true
+  expect((await chat(plugin, kept)).status).toBe(401)
+  expect(reads).toBe(1)
+  expired = false
+  expect((await chat(plugin, kept)).status).toBe(200)
+  expect(reads).toBe(2)
+  globalThis.fetch = realFetch
+})
+
+test("a session that was pasted by hand never reads a browser", async () => {
+  const mock = mockNotion()
+  const session = { findSession: async () => { throw new Error("a browser must not be read") } }
+  const plugin = createPlugin(protocol, { session })
+  const auth = { type: "api", key: "token_v2=by-hand", metadata: { spaceId: UUID, activeUserId: USER } }
+  expect((await chat(plugin, auth)).status).toBe(200)
+  expect(new Set(mock.calls.map((call) => cookieValue(call.init.headers.Cookie, "token_v2")))).toEqual(new Set(["by-hand"]))
+  globalThis.fetch = realFetch
+})
+
+test("reusing one browser read does not mix up the accounts that share it", async () => {
+  const mock = mockNotion()
+  const other = "33333333-3333-4333-8333-333333333333"
+  let reads = 0
+  const session = { findSession: async () => { reads++; return { cookie: "token_v2=live", browser: "Chrome", profile: "Default" } } }
+  const plugin = createPlugin(protocol, { session })
+  const first = { type: "api", key: "token_v2=kept", metadata: { browser: "Chrome", profile: "Default", spaceId: UUID } }
+  const second = { type: "api", key: "token_v2=kept", metadata: { browser: "Chrome", profile: "Default", spaceId: other } }
+  expect((await chat(plugin, first)).status).toBe(200)
+  expect((await chat(plugin, second)).status).toBe(200)
+  expect(reads).toBe(1)
+  // One read is shared, but each request still runs in the workspace its own
+  // sign-in names.
+  const created = mock.calls.filter((call) => call.name === "createAgentThread")
+  expect(created.map((call) => call.data.spaceId)).toEqual([UUID, other])
+  expect(created.every((call) => cookieValue(call.init.headers.Cookie, "token_v2") === "live")).toBe(true)
+  globalThis.fetch = realFetch
+})
+
+test("a browser read that fails keeps the saved session and the reason it failed", async () => {
+  const session = { findSession: async () => { throw new SessionError("Chrome is running and holds its cookie store open; close Chrome and sign in again", "locked") } }
+  const reader = browserReader(session, 60_000)
+  const kept = { type: "api", key: "token_v2=kept", metadata: { browser: "Chrome", profile: "Default", spaceId: UUID } }
+  const read = await reader.read(kept)
+  expect(read.key).toBe("token_v2=kept")
+  expect(read.metadata.spaceId).toBe(UUID)
+  expect(read.metadata.lastReadError).toContain("close Chrome")
 })
 
 function mockNotion(handle) {

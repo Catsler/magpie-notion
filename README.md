@@ -16,22 +16,40 @@ magpie plugin add github:resucdueff/magpie-notion
 magpie plugin login notion
 ```
 
-Magpie 添加插件时会安装运行依赖。运行时 provider id 仍是 `notion`；插件列表中
-显示的名称是 `magpie-notion`。
+这个插件没有运行依赖，不需要 Magpie 安装原生模块。运行时 provider id 仍是
+`notion`；插件列表中显示的名称是 `magpie-notion`。
 
 ## 登录
 
-登录只有一个输入框：粘贴你自己的 Notion `token_v2`。
+登录页有两个方式，优先用第一个。
+
+### 1. 用本机浏览器里的 Notion 会话（推荐）
+
+打开 https://www.notion.so/login；如果那个浏览器还没登录 Notion，先登录。之后
+Magpie 会从本机的 Chrome、Edge、Brave、Chromium 或 Firefox 配置里读取这个会话，
+不轮询浏览器，也不用粘贴任何东西。工作区 UUID 自动发现，不用填。
+
+读不到时会说明是哪一种，并指向第二个方式：
+
+- **权限不足**（macOS）：系统不允许 magpie 读取浏览器的数据目录。到「系统设置 ›
+  隐私与安全性 › 完全磁盘访问权限」里给 magpie 打开，再登录一次。
+- **钥匙串拒绝**：登录钥匙串没有交出浏览器用来加密 Cookie 的那把钥匙。这种情况
+  即使给了完全磁盘访问权限也读不到，直接用第二个方式。
+- **浏览器占用文件**：浏览器正开着并持有 Cookie 数据库。关掉那个浏览器再试。
+- **本机没有登录 Notion 的浏览器**：换一台已登录的机器，或用第二个方式。
+
+### 2. 粘贴 `token_v2`
+
+只有一个输入框：
 
 - 可以只粘贴 `token_v2` 的值。
 - 也可以误贴整段含 `token_v2=` 的 Cookie；插件只提取 `token_v2`，不会使用其中
   的其他 Cookie。
 - 空内容、找不到 `token_v2`、带换行的输入都会被拒绝。
 - 登录失败时提示：`请粘贴 Notion 的 token_v2。`
-- 不打开网页，也不轮询浏览器。
 
-登录不需要填写工作区 UUID。插件会调用 `getSpaces` 自动发现账号可用的工作区，
-再通过模型目录确认当前工作区。`token_v2` 只交给宿主自己的认证存储保存，不要
+两种方式都不需要填写工作区 UUID。插件会调用 `getSpaces` 自动发现账号可用的工作区，
+再通过模型目录确认当前工作区。会话值只交给宿主自己的认证存储保存，不要
 写进源码、命令参数、日志或提交记录。
 
 ### 获取 `token_v2`

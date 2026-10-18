@@ -344,7 +344,10 @@ test("package entry exports only the plugin and all declared runtime files exist
   expect(pkg).toMatchObject({ name: "magpie-notion", version: "1.0.1" })
   expect(pkg.description).toContain("token_v2")
   expect(plugin.auth.provider).toBe("notion")
-  expect(plugin.auth.methods).toEqual([{ type: "api", label: "粘贴 token_v2", placeholder: "只粘贴 token_v2" }])
+  expect(plugin.auth.methods).toEqual([
+    { type: "oauth", label: "用本机浏览器里的 Notion 会话", authorize: expect.any(Function) },
+    { type: "api", label: "粘贴 token_v2", placeholder: "只粘贴 token_v2" },
+  ])
   for (const file of pkg.files) expect(existsSync(new URL("../" + file, import.meta.url))).toBe(true)
   expect(pkg.files).not.toContain("independent.test.mjs")
   // standalone repository: it ships as a public npm package with a magpie icon

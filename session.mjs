@@ -474,8 +474,16 @@ function toBuffer(value) {
 // browsers open the Cookies database so that nothing else may read it, which a
 // running browser reports as EBUSY/EPERM; that is the one failure the caller
 // can fix by closing the browser, so it gets its own words.
+//
+// macOS reports the same errno for a different thing: the system denies this
+// app the browser's data directory until it is given Full Disk Access, and no
+// browser needs to be running for that. Telling the two apart matters, because
+// "close the browser" is advice that never works on the permission one - the
+// read fails again the moment it is retried, which reads as a sign-in that can
+// never be made.
 export function copyToTemporary(store, options = {}) {
   const copy = options.copyFile ?? copyFileSync
+  const platform = options.platform ?? process.platform
   const directory = mkdtempSync(join(tmpdir(), "magpie-notion-"))
   const path = join(directory, "cookies.db")
   try {
@@ -483,6 +491,11 @@ export function copyToTemporary(store, options = {}) {
   } catch (error) {
     discard(directory)
     const code = error?.code
+    if (platform === "darwin" && (code === "EPERM" || code === "EACCES")) {
+      // The way out is named once, by the sign-in that reports this, so this
+      // message stays the permission it is asking for and nothing else.
+      throw new SessionError(`macOS does not let this app read ${store.browser}'s data; give magpie Full Disk Access in System Settings › Privacy & Security › Full Disk Access and sign in again`, "permission")
+    }
     if (code === "EBUSY" || code === "EPERM" || code === "EACCES") {
       throw new SessionError(`${store.browser} is running and holds its cookie store open; close ${store.browser} and sign in again`, "locked")
     }
